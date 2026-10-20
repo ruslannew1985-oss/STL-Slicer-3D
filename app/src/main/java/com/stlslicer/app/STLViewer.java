@@ -277,7 +277,8 @@ gl.glDrawArrays(GL10.GL_TRIANGLES, 0, vertexCount);
 
 gl.glDisable(GL10.GL_POLYGON_OFFSET_FILL);
 
-gl.glColor4f(0.05f, 0.10f, 0.15f, 1f);
+gl.glDisable(GL10.GL_LIGHTING);
+            gl.glColor4f(0.05f, 0.10f, 0.15f, 1f);
 gl.glLineWidth(1.0f);
 
 for (int i = 0; i < vertexCount; i += 3) {

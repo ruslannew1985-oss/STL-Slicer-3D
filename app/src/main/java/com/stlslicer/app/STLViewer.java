@@ -169,8 +169,10 @@ public class STLViewer extends GLSurfaceView {
         }
 
         synchronized void rotate(float dx, float dy) {
-            rotY += dx * 0.5f;
-            rotX += dy * 0.5f;
+    rotY += dx * 0.7f;
+    rotX += dy * 0.7f;
+
+    rotX = Math.max(-180f, Math.min(180f, rotX));
         }
 
         synchronized void zoom(float ratio) {

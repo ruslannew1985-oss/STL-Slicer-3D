@@ -14,6 +14,7 @@ public class MainActivity extends Activity {
 
     TextView fileInfo, status;
     EditText nozzle, bed, layer, speed, infill;
+    boolean modelLoaded = false;
     Uri selectedFile;
 STLViewer stlViewer;
 LinearLayout rootLayout;
@@ -95,7 +96,7 @@ root.addView(stlViewer, new LinearLayout.LayoutParams(
         });
 
         slice.setOnClickListener(v -> {
-            if (selectedFile == null) {
+            if (!modelLoaded) {
                 status.setText("Сначала выберите STL-файл");
             } else {
                 status.setText(
@@ -133,16 +134,21 @@ root.addView(stlViewer, new LinearLayout.LayoutParams(
                     fileInfo.setText("STL выбран");
                 }
 
-                selectedFile = uri;
+                selectedFile = null;
+                modelLoaded = false;
                 try {
     stlViewer.loadSTL(uri);
+    selectedFile = uri;
+    modelLoaded = true;
     fileInfo.setText("3D-модель загружена");
     status.setText("Вращайте модель пальцем");
 } catch (Exception e) {
     fileInfo.setText("Ошибка открытия STL");
     status.setText(e.getMessage());
                 }
-                status.setText("Файл готов к обработке");
+                if (modelLoaded) {
+                    status.setText("STL загружен. Для G-code требуется настоящий офлайн-движок слайсинга.");
+                }
             }
         }
     }

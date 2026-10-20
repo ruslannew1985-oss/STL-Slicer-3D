@@ -266,6 +266,8 @@ gl.glEnable(GL10.GL_COLOR_MATERIAL);
             if (vertices == null) return;
 
             gl.glEnableClientState(GL10.GL_VERTEX_ARRAY);
+            gl.glEnableClientState(GL10.GL_NORMAL_ARRAY);
+gl.glNormalPointer(GL10.GL_FLOAT, 0, normals);
             gl.glVertexPointer(3, GL10.GL_FLOAT, 0, vertices);
             gl.glColor4f(0.2f, 0.75f, 0.95f, 1f);
             gl.glEnable(GL10.GL_POLYGON_OFFSET_FILL);

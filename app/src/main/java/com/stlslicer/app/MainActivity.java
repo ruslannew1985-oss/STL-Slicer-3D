@@ -60,7 +60,12 @@ LinearLayout rootLayout;
         fileInfo.setText("Файл не выбран");
         fileInfo.setTextSize(16);
         root.addView(fileInfo);
+        stlViewer = new STLViewer(this);
 
+root.addView(stlViewer, new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT,
+        600
+));
         TextView settings = new TextView(this);
         settings.setText("Параметры печати PETG");
         settings.setTextSize(21);

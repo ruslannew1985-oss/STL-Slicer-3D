@@ -283,7 +283,7 @@ gl.glLineWidth(1.0f);
 for (int i = 0; i < vertexCount; i += 3) {
     gl.glDrawArrays(GL10.GL_LINE_LOOP, i, 3);
 }
-            gl.glDisableClientState(GL10.GL_VERTEX_ARRAY);
+        gl.glDisableClientState(GL10.GL_NORMAL_ARRAY);    gl.glDisableClientState(GL10.GL_VERTEX_ARRAY);
         }
     }
 }

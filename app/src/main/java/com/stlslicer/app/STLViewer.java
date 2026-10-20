@@ -210,7 +210,19 @@ public class STLViewer extends GLSurfaceView {
             gl.glEnableClientState(GL10.GL_VERTEX_ARRAY);
             gl.glVertexPointer(3, GL10.GL_FLOAT, 0, vertices);
             gl.glColor4f(0.2f, 0.75f, 0.95f, 1f);
-            gl.glDrawArrays(GL10.GL_TRIANGLES, 0, vertexCount);
+            gl.glEnable(GL10.GL_POLYGON_OFFSET_FILL);
+gl.glPolygonOffset(1.0f, 1.0f);
+
+gl.glDrawArrays(GL10.GL_TRIANGLES, 0, vertexCount);
+
+gl.glDisable(GL10.GL_POLYGON_OFFSET_FILL);
+
+gl.glColor4f(0.05f, 0.10f, 0.15f, 1f);
+gl.glLineWidth(1.0f);
+
+for (int i = 0; i < vertexCount; i += 3) {
+    gl.glDrawArrays(GL10.GL_LINE_LOOP, i, 3);
+}
             gl.glDisableClientState(GL10.GL_VERTEX_ARRAY);
         }
     }

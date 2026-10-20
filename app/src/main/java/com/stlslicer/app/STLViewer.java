@@ -131,6 +131,7 @@ public class STLViewer extends GLSurfaceView {
 
     private static class ModelRenderer implements Renderer {
         private FloatBuffer vertices;
+        private FloatBuffer normals;
         private int vertexCount;
         private float rotX = 25f, rotY = -35f;
         private float zoom = 1f;

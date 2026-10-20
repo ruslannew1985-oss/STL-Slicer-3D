@@ -165,6 +165,46 @@ public class STLViewer extends GLSurfaceView {
                     .order(ByteOrder.nativeOrder());
             FloatBuffer fb = bb.asFloatBuffer();
             fb.put(data).position(0);
+            
+float[] normalData = new float[data.length];
+
+for (int i = 0; i < data.length; i += 9) {
+    float ax = data[i + 3] - data[i];
+    float ay = data[i + 4] - data[i + 1];
+    float az = data[i + 5] - data[i + 2];
+
+    float bx = data[i + 6] - data[i];
+    float by = data[i + 7] - data[i + 1];
+    float bz = data[i + 8] - data[i + 2];
+
+    float nx = ay * bz - az * by;
+    float ny = az * bx - ax * bz;
+    float nz = ax * by - ay * bx;
+
+    float length = (float) Math.sqrt(
+            nx * nx + ny * ny + nz * nz);
+
+    if (length > 0) {
+        nx /= length;
+        ny /= length;
+        nz /= length;
+    }
+
+    for (int j = 0; j < 9; j += 3) {
+        normalData[i + j] = nx;
+        normalData[i + j + 1] = ny;
+        normalData[i + j + 2] = nz;
+    }
+}
+
+ByteBuffer normalBuffer = ByteBuffer
+        .allocateDirect(normalData.length * 4)
+        .order(ByteOrder.nativeOrder());
+
+normals = normalBuffer.asFloatBuffer();
+normals.put(normalData);
+normals.position(0);
+            
             vertices = fb;
             vertexCount = data.length / 3;
         }

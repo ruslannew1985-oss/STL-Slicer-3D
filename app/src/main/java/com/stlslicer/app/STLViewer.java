@@ -185,6 +185,21 @@ public class STLViewer extends GLSurfaceView {
             gl.glClearColor(0.10f, 0.12f, 0.16f, 1f);
             gl.glDisable(GL10.GL_CULL_FACE);
             gl.glEnable(GL10.GL_DEPTH_TEST);
+            gl.glEnable(GL10.GL_LIGHTING);
+gl.glEnable(GL10.GL_LIGHT0);
+
+float[] lightPosition = {1f, 1f, 3f, 0f};
+float[] ambient = {0.35f, 0.35f, 0.35f, 1f};
+float[] diffuse = {0.8f, 0.8f, 0.8f, 1f};
+
+gl.glLightfv(GL10.GL_LIGHT0, GL10.GL_POSITION,
+        lightPosition, 0);
+gl.glLightfv(GL10.GL_LIGHT0, GL10.GL_AMBIENT,
+        ambient, 0);
+gl.glLightfv(GL10.GL_LIGHT0, GL10.GL_DIFFUSE,
+        diffuse, 0);
+
+gl.glEnable(GL10.GL_COLOR_MATERIAL);
         }
 
         @Override

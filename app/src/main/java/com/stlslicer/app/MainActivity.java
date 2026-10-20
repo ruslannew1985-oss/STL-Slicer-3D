@@ -134,6 +134,14 @@ root.addView(stlViewer, new LinearLayout.LayoutParams(
                 }
 
                 selectedFile = uri;
+                try {
+    stlViewer.loadSTL(uri);
+    fileInfo.setText("3D-модель загружена");
+    status.setText("Вращайте модель пальцем");
+} catch (Exception e) {
+    fileInfo.setText("Ошибка открытия STL");
+    status.setText(e.getMessage());
+                }
                 status.setText("Файл готов к обработке");
             }
         }

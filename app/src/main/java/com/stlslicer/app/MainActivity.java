@@ -15,7 +15,8 @@ public class MainActivity extends Activity {
     TextView fileInfo, status;
     EditText nozzle, bed, layer, speed, infill;
     Uri selectedFile;
-
+STLViewer stlViewer;
+LinearLayout rootLayout;
     EditText addField(LinearLayout root, String label, String value) {
         TextView text = new TextView(this);
         text.setText(label);

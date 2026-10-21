@@ -7,6 +7,7 @@ import android.net.Uri;
 import android.provider.OpenableColumns;
 import android.database.Cursor;
 import android.graphics.Color;
+import android.view.View;
 import android.widget.*;
 
 import java.io.*;
@@ -18,11 +19,13 @@ public class MainActivity extends Activity {
     private static final int REQ_OPEN_STL = 10;
     private static final int REQ_SAVE_GCODE = 11;
 
-    private TextView fileInfo, status;
+    private TextView fileInfo, status, layerLabel;
     private EditText nozzle, bed, layer, speed, infill;
     private Button sliceButton;
+    private SeekBar layerSeek;
     private Uri selectedFile;
     private STLViewer stlViewer;
+    private LayerPreviewView layerPreview;
     private File generatedGcode;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
 
@@ -97,6 +100,35 @@ public class MainActivity extends Activity {
         status.setTextSize(16);
         root.addView(status);
 
+        layerLabel = new TextView(this);
+        layerLabel.setText("Просмотр слоя");
+        layerLabel.setTextSize(18);
+        layerLabel.setTextColor(Color.BLACK);
+        layerLabel.setVisibility(View.GONE);
+        root.addView(layerLabel);
+
+        layerSeek = new SeekBar(this);
+        layerSeek.setVisibility(View.GONE);
+        root.addView(layerSeek);
+
+        layerPreview = new LayerPreviewView(this);
+        layerPreview.setVisibility(View.GONE);
+        root.addView(layerPreview, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                700
+        ));
+
+        layerSeek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                layerPreview.setLayer(progress);
+                layerLabel.setText("Слой " + (progress + 1) + " из " + layerPreview.getLayerCount());
+            }
+
+            @Override public void onStartTrackingTouch(SeekBar seekBar) {}
+            @Override public void onStopTrackingTouch(SeekBar seekBar) {}
+        });
+
         open.setOnClickListener(v -> openStl());
         sliceButton.setOnClickListener(v -> startSlicing());
     }
@@ -124,6 +156,7 @@ public class MainActivity extends Activity {
         }
 
         sliceButton.setEnabled(false);
+        hideLayerPreview();
         status.setText("Подготовка модели...");
 
         worker.execute(() -> {
@@ -143,19 +176,43 @@ public class MainActivity extends Activity {
                 });
 
                 generatedGcode = temp;
+                int previewLayers = layerPreview.loadGcode(temp);
+
                 runOnUiThread(() -> {
                     sliceButton.setEnabled(true);
-                    status.setText("G-code готов. Выберите, куда сохранить файл.");
+                    showLayerPreview(previewLayers);
+                    status.setText("G-code готов. Можно проверить слои и сохранить файл.");
                     askWhereToSave();
                 });
             } catch (Exception e) {
                 if (temp.exists()) temp.delete();
                 runOnUiThread(() -> {
                     sliceButton.setEnabled(true);
+                    hideLayerPreview();
                     status.setText("Ошибка слайсинга: " + safeMessage(e));
                 });
             }
         });
+    }
+
+    private void showLayerPreview(int count) {
+        if (count <= 0) {
+            hideLayerPreview();
+            return;
+        }
+        layerSeek.setMax(Math.max(0, count - 1));
+        layerSeek.setProgress(0);
+        layerPreview.setLayer(0);
+        layerLabel.setText("Слой 1 из " + count);
+        layerLabel.setVisibility(View.VISIBLE);
+        layerSeek.setVisibility(View.VISIBLE);
+        layerPreview.setVisibility(View.VISIBLE);
+    }
+
+    private void hideLayerPreview() {
+        layerLabel.setVisibility(View.GONE);
+        layerSeek.setVisibility(View.GONE);
+        layerPreview.setVisibility(View.GONE);
     }
 
     private SlicerEngine.Settings readSettings() {
@@ -194,7 +251,9 @@ public class MainActivity extends Activity {
 
         Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
-        intent.setType("text/plain");
+        // text/plain заставлял некоторые файловые менеджеры добавлять .txt.
+        // application/octet-stream сохраняет точное имя model.gcode.
+        intent.setType("application/octet-stream");
         intent.putExtra(Intent.EXTRA_TITLE, makeGcodeName());
         startActivityForResult(intent, REQ_SAVE_GCODE);
     }
@@ -212,6 +271,21 @@ public class MainActivity extends Activity {
         Cursor cursor = null;
         try {
             cursor = getContentResolver().query(selectedFile, null, null, null, null);
+            if (cursor != null && cursor.moveToFirst()) {
+                int index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                if (index >= 0) return cursor.getString(index);
+            }
+        } catch (Exception ignored) {
+        } finally {
+            if (cursor != null) cursor.close();
+        }
+        return null;
+    }
+
+    private String getDisplayName(Uri uri) {
+        Cursor cursor = null;
+        try {
+            cursor = getContentResolver().query(uri, null, null, null, null);
             if (cursor != null && cursor.moveToFirst()) {
                 int index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
                 if (index >= 0) return cursor.getString(index);
@@ -241,9 +315,14 @@ public class MainActivity extends Activity {
                 while ((n = in.read(buffer)) != -1) out.write(buffer, 0, n);
                 out.flush();
 
-                runOnUiThread(() ->
-                        status.setText("Готово: G-code сохранён в память телефона")
-                );
+                String savedName = getDisplayName(destination);
+                runOnUiThread(() -> {
+                    if (savedName != null && savedName.toLowerCase().endsWith(".gcode")) {
+                        status.setText("Готово: " + savedName + ". Листайте слои ползунком ниже.");
+                    } else {
+                        status.setText("G-code сохранён. Листайте слои ползунком ниже.");
+                    }
+                });
             } catch (Exception e) {
                 runOnUiThread(() ->
                         status.setText("Ошибка сохранения: " + safeMessage(e))
@@ -267,6 +346,7 @@ public class MainActivity extends Activity {
 
             selectedFile = uri;
             generatedGcode = null;
+            hideLayerPreview();
 
             try {
                 int flags = data.getFlags() &

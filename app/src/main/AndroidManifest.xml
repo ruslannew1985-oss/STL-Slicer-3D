@@ -10,11 +10,49 @@
 
         <activity
             android:name="com.stlslicer.app.MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:launchMode="singleTop">
 
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- Open model files from Telegram, Downloads and file managers. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="model/stl" />
+                <data android:mimeType="application/sla" />
+                <data android:mimeType="application/vnd.ms-pki.stl" />
+                <data android:mimeType="model/3mf" />
+                <data android:mimeType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml" />
+                <data android:mimeType="application/zip" />
+                <data android:mimeType="application/x-zip-compressed" />
+                <data android:mimeType="application/octet-stream" />
+            </intent-filter>
+
+            <!-- Some providers expose a generic MIME type but keep the extension in the URI. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" android:mimeType="*/*" android:pathPattern=".*\.stl" />
+                <data android:scheme="content" android:mimeType="*/*" android:pathPattern=".*\.3mf" />
+                <data android:scheme="content" android:mimeType="*/*" android:pathPattern=".*\.zip" />
+                <data android:scheme="file" android:mimeType="*/*" android:pathPattern=".*\.stl" />
+                <data android:scheme="file" android:mimeType="*/*" android:pathPattern=".*\.3mf" />
+                <data android:scheme="file" android:mimeType="*/*" android:pathPattern=".*\.zip" />
+            </intent-filter>
+
+            <!-- Also support Telegram/File-manager Share actions. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="model/stl" />
+                <data android:mimeType="model/3mf" />
+                <data android:mimeType="application/zip" />
+                <data android:mimeType="application/x-zip-compressed" />
+                <data android:mimeType="application/octet-stream" />
             </intent-filter>
 
         </activity>

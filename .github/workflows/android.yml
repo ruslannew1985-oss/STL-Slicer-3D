@@ -1,8 +1,9 @@
-
 name: Build STL Slicer APK
 
 on:
   push:
+    branches: [main, feature/offline-slicer-engine]
+  pull_request:
     branches: [main]
   workflow_dispatch:
 
@@ -20,11 +21,11 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
           packages: ''
+
       - name: Install SDK packages
         run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
 

@@ -19,13 +19,13 @@ public class MainActivity extends Activity {
     private static final int REQ_OPEN_STL = 10;
     private static final int REQ_SAVE_GCODE = 11;
 
-    private TextView fileInfo, status, layerLabel;
+    private TextView fileInfo, status, layerLabel, gcodeHint;
     private EditText nozzle, bed, layer, speed, infill;
-    private Button sliceButton;
+    private Button sliceButton, resetGcodeView;
     private SeekBar layerSeek;
     private Uri selectedFile;
     private STLViewer stlViewer;
-    private LayerPreviewView layerPreview;
+    private Gcode3DViewer gcodeViewer;
     private File generatedGcode;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
 
@@ -101,34 +101,46 @@ public class MainActivity extends Activity {
         root.addView(status);
 
         layerLabel = new TextView(this);
-        layerLabel.setText("Просмотр слоя");
-        layerLabel.setTextSize(18);
+        layerLabel.setText("3D-просмотр G-code");
+        layerLabel.setTextSize(20);
         layerLabel.setTextColor(Color.BLACK);
         layerLabel.setVisibility(View.GONE);
         root.addView(layerLabel);
+
+        gcodeHint = new TextView(this);
+        gcodeHint.setText("Вращение — одним пальцем. Масштаб — двумя пальцами. Ползунок показывает модель до выбранного слоя.");
+        gcodeHint.setTextSize(14);
+        gcodeHint.setVisibility(View.GONE);
+        root.addView(gcodeHint);
 
         layerSeek = new SeekBar(this);
         layerSeek.setVisibility(View.GONE);
         root.addView(layerSeek);
 
-        layerPreview = new LayerPreviewView(this);
-        layerPreview.setVisibility(View.GONE);
-        root.addView(layerPreview, new LinearLayout.LayoutParams(
+        resetGcodeView = new Button(this);
+        resetGcodeView.setText("СБРОСИТЬ 3D-ВИД");
+        resetGcodeView.setVisibility(View.GONE);
+        root.addView(resetGcodeView);
+
+        gcodeViewer = new Gcode3DViewer(this);
+        gcodeViewer.setVisibility(View.GONE);
+        root.addView(gcodeViewer, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
-                700
+                760
         ));
 
         layerSeek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
-                layerPreview.setLayer(progress);
-                layerLabel.setText("Слой " + (progress + 1) + " из " + layerPreview.getLayerCount());
+                gcodeViewer.setLayer(progress);
+                layerLabel.setText("3D G-code: слой " + (progress + 1) + " из " + gcodeViewer.getLayerCount());
             }
 
             @Override public void onStartTrackingTouch(SeekBar seekBar) {}
             @Override public void onStopTrackingTouch(SeekBar seekBar) {}
         });
 
+        resetGcodeView.setOnClickListener(v -> gcodeViewer.resetView());
         open.setOnClickListener(v -> openStl());
         sliceButton.setOnClickListener(v -> startSlicing());
     }
@@ -156,7 +168,7 @@ public class MainActivity extends Activity {
         }
 
         sliceButton.setEnabled(false);
-        hideLayerPreview();
+        hideGcodePreview();
         status.setText("Подготовка модели...");
 
         worker.execute(() -> {
@@ -176,43 +188,48 @@ public class MainActivity extends Activity {
                 });
 
                 generatedGcode = temp;
-                int previewLayers = layerPreview.loadGcode(temp);
+                int previewLayers = gcodeViewer.loadGcode(temp);
 
                 runOnUiThread(() -> {
                     sliceButton.setEnabled(true);
-                    showLayerPreview(previewLayers);
-                    status.setText("G-code готов. Можно проверить слои и сохранить файл.");
+                    showGcodePreview(previewLayers);
+                    status.setText("G-code готов. Проверьте объёмную модель по слоям и сохраните файл.");
                     askWhereToSave();
                 });
             } catch (Exception e) {
                 if (temp.exists()) temp.delete();
                 runOnUiThread(() -> {
                     sliceButton.setEnabled(true);
-                    hideLayerPreview();
+                    hideGcodePreview();
                     status.setText("Ошибка слайсинга: " + safeMessage(e));
                 });
             }
         });
     }
 
-    private void showLayerPreview(int count) {
+    private void showGcodePreview(int count) {
         if (count <= 0) {
-            hideLayerPreview();
+            hideGcodePreview();
             return;
         }
-        layerSeek.setMax(Math.max(0, count - 1));
-        layerSeek.setProgress(0);
-        layerPreview.setLayer(0);
-        layerLabel.setText("Слой 1 из " + count);
+        int last = count - 1;
+        layerSeek.setMax(last);
+        layerSeek.setProgress(last);
+        gcodeViewer.setLayer(last);
+        layerLabel.setText("3D G-code: слой " + count + " из " + count);
         layerLabel.setVisibility(View.VISIBLE);
+        gcodeHint.setVisibility(View.VISIBLE);
         layerSeek.setVisibility(View.VISIBLE);
-        layerPreview.setVisibility(View.VISIBLE);
+        resetGcodeView.setVisibility(View.VISIBLE);
+        gcodeViewer.setVisibility(View.VISIBLE);
     }
 
-    private void hideLayerPreview() {
+    private void hideGcodePreview() {
         layerLabel.setVisibility(View.GONE);
+        gcodeHint.setVisibility(View.GONE);
         layerSeek.setVisibility(View.GONE);
-        layerPreview.setVisibility(View.GONE);
+        resetGcodeView.setVisibility(View.GONE);
+        gcodeViewer.setVisibility(View.GONE);
     }
 
     private SlicerEngine.Settings readSettings() {
@@ -251,8 +268,6 @@ public class MainActivity extends Activity {
 
         Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
-        // text/plain заставлял некоторые файловые менеджеры добавлять .txt.
-        // application/octet-stream сохраняет точное имя model.gcode.
         intent.setType("application/octet-stream");
         intent.putExtra(Intent.EXTRA_TITLE, makeGcodeName());
         startActivityForResult(intent, REQ_SAVE_GCODE);
@@ -318,9 +333,9 @@ public class MainActivity extends Activity {
                 String savedName = getDisplayName(destination);
                 runOnUiThread(() -> {
                     if (savedName != null && savedName.toLowerCase().endsWith(".gcode")) {
-                        status.setText("Готово: " + savedName + ". Листайте слои ползунком ниже.");
+                        status.setText("Готово: " + savedName + ". 3D-просмотр остаётся доступен ниже.");
                     } else {
-                        status.setText("G-code сохранён. Листайте слои ползунком ниже.");
+                        status.setText("G-code сохранён. 3D-просмотр остаётся доступен ниже.");
                     }
                 });
             } catch (Exception e) {
@@ -346,7 +361,7 @@ public class MainActivity extends Activity {
 
             selectedFile = uri;
             generatedGcode = null;
-            hideLayerPreview();
+            hideGcodePreview();
 
             try {
                 int flags = data.getFlags() &

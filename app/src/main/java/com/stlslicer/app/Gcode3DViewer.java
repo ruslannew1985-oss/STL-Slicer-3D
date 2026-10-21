@@ -12,16 +12,21 @@ import java.nio.FloatBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
 
 import javax.microedition.khronos.egl.EGLConfig;
 import javax.microedition.khronos.opengles.GL10;
 
 public class Gcode3DViewer extends GLSurfaceView {
 
+    public interface OnPlacementChangedListener {
+        void onPlacementChanged(float centerX, float centerY);
+    }
+
     private final ToolpathRenderer renderer;
     private float lastX, lastY;
     private float pinchDistance = -1f;
+    private boolean placementMode = false;
+    private OnPlacementChangedListener placementListener;
 
     public Gcode3DViewer(Context context) {
         super(context);
@@ -36,7 +41,9 @@ public class Gcode3DViewer extends GLSurfaceView {
         if (layers.isEmpty()) throw new IOException("В G-code не найдено печатных траекторий");
         renderer.setLayers(layers);
         renderer.setLayer(layers.size() - 1);
+        placementMode = false;
         requestRender();
+        notifyPlacement();
         return layers.size();
     }
 
@@ -51,7 +58,52 @@ public class Gcode3DViewer extends GLSurfaceView {
 
     public void resetView() {
         renderer.resetView();
+        placementMode = false;
         requestRender();
+    }
+
+    public void setPlacementMode(boolean enabled) {
+        placementMode = enabled;
+        if (enabled) renderer.topView();
+        else renderer.threeDView();
+        requestRender();
+    }
+
+    public boolean isPlacementMode() {
+        return placementMode;
+    }
+
+    public void centerOnBed() {
+        renderer.centerOnBed();
+        requestRender();
+        notifyPlacement();
+    }
+
+    public float getOffsetX() {
+        return renderer.getOffsetX();
+    }
+
+    public float getOffsetY() {
+        return renderer.getOffsetY();
+    }
+
+    public float getModelCenterX() {
+        return renderer.getPlacedCenterX();
+    }
+
+    public float getModelCenterY() {
+        return renderer.getPlacedCenterY();
+    }
+
+    public void setOnPlacementChangedListener(OnPlacementChangedListener listener) {
+        placementListener = listener;
+    }
+
+    private void notifyPlacement() {
+        if (placementListener != null) {
+            placementListener.onPlacementChanged(
+                    renderer.getPlacedCenterX(), renderer.getPlacedCenterY());
+        }
     }
 
     private List<float[]> parseGcode(File file) throws IOException {
@@ -87,7 +139,9 @@ public class Gcode3DViewer extends GLSurfaceView {
                     continue;
                 }
 
-                if (!(line.startsWith("G0") || line.startsWith("G1"))) continue;
+                String command = firstWord(line).toUpperCase();
+                if (!(command.equals("G0") || command.equals("G00") ||
+                        command.equals("G1") || command.equals("G01"))) continue;
 
                 Double vx = valueOf(line, 'X');
                 Double vy = valueOf(line, 'Y');
@@ -100,7 +154,8 @@ public class Gcode3DViewer extends GLSurfaceView {
                 double ne = ve == null ? e : (absoluteE ? ve : e + ve);
 
                 boolean extruding = ve != null && ne > e + 1e-7;
-                if (extruding && currentLayer >= 0 && (Math.abs(nx - x) > 1e-7 || Math.abs(ny - y) > 1e-7)) {
+                if (extruding && currentLayer >= 0 &&
+                        (Math.abs(nx - x) > 1e-7 || Math.abs(ny - y) > 1e-7)) {
                     while (rawLayers.size() <= currentLayer) rawLayers.add(new ArrayList<>());
                     List<Float> layer = rawLayers.get(currentLayer);
                     add(layer, (float)x, (float)y, (float)z);
@@ -120,6 +175,17 @@ public class Gcode3DViewer extends GLSurfaceView {
         return layers;
     }
 
+    private static String firstWord(String line) {
+        String t = line.trim();
+        int space = t.indexOf(' ');
+        int tab = t.indexOf('\t');
+        int end;
+        if (space < 0) end = tab;
+        else if (tab < 0) end = space;
+        else end = Math.min(space, tab);
+        return end < 0 ? t : t.substring(0, end);
+    }
+
     private static void add(List<Float> list, float x, float y, float z) {
         list.add(x); list.add(y); list.add(z);
     }
@@ -134,7 +200,8 @@ public class Gcode3DViewer extends GLSurfaceView {
                 int k = j;
                 while (k < line.length()) {
                     char c = line.charAt(k);
-                    if ((c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E') k++;
+                    if ((c >= '0' && c <= '9') || c == '-' || c == '+' ||
+                            c == '.' || c == 'e' || c == 'E') k++;
                     else break;
                 }
                 if (k > j) {
@@ -166,8 +233,18 @@ public class Gcode3DViewer extends GLSurfaceView {
             lastY = event.getY();
             return true;
         }
+
         if (event.getActionMasked() == MotionEvent.ACTION_MOVE) {
-            renderer.rotate(event.getX() - lastX, event.getY() - lastY);
+            float dx = event.getX() - lastX;
+            float dy = event.getY() - lastY;
+
+            if (placementMode) {
+                renderer.moveOnBed(dx, dy, getWidth(), getHeight());
+                notifyPlacement();
+            } else {
+                renderer.rotate(dx, dy);
+            }
+
             lastX = event.getX();
             lastY = event.getY();
             requestRender();
@@ -176,22 +253,52 @@ public class Gcode3DViewer extends GLSurfaceView {
     }
 
     private static class ToolpathRenderer implements Renderer {
+        private static final float BED_X = 220f;
+        private static final float BED_Y = 220f;
+
         private List<float[]> layers = new ArrayList<>();
         private int selectedLayer = 0;
         private FloatBuffer lowerBuffer;
         private FloatBuffer currentBuffer;
+        private FloatBuffer bedBuffer;
         private int lowerVertices = 0;
         private int currentVertices = 0;
+        private int bedVertices = 0;
 
-        private float centerX, centerY, centerZ, modelScale = 1f;
+        private float minX, minY, minZ, maxX, maxY, maxZ;
+        private float originalCenterX = 110f, originalCenterY = 110f;
+        private float offsetX = 0f, offsetY = 0f;
+        private float worldCenterZ = 0f;
+        private float worldScale = 1f;
+
         private float rotX = 58f, rotY = -38f;
         private float zoom = 1f;
 
+        ToolpathRenderer() {
+            buildBed();
+        }
+
         synchronized int getLayerCount() { return layers.size(); }
+        synchronized float getOffsetX() { return offsetX; }
+        synchronized float getOffsetY() { return offsetY; }
+        synchronized float getPlacedCenterX() { return originalCenterX + offsetX; }
+        synchronized float getPlacedCenterY() { return originalCenterY + offsetY; }
 
         synchronized void resetView() {
             rotX = 58f;
             rotY = -38f;
+            zoom = 1f;
+        }
+
+        synchronized void threeDView() {
+            rotX = 58f;
+            rotY = -38f;
+            zoom = 1f;
+        }
+
+        synchronized void topView() {
+            rotX = 0f;
+            rotY = 0f;
             zoom = 1f;
         }
 
@@ -203,12 +310,41 @@ public class Gcode3DViewer extends GLSurfaceView {
 
         synchronized void zoom(float ratio) {
             if (ratio > 0.1f && ratio < 10f)
-                zoom = Math.max(0.2f, Math.min(6f, zoom * ratio));
+                zoom = Math.max(0.35f, Math.min(6f, zoom * ratio));
+        }
+
+        synchronized void centerOnBed() {
+            offsetX = 110f - originalCenterX;
+            offsetY = 110f - originalCenterY;
+            clampOffset();
+        }
+
+        synchronized void moveOnBed(float pixelDx, float pixelDy, int width, int height) {
+            if (width <= 0 || height <= 0) return;
+            float visibleMm = 255f / Math.max(0.35f, zoom);
+            float mmPerPixel = visibleMm / Math.max(1f, Math.min(width, height));
+            offsetX += pixelDx * mmPerPixel;
+            offsetY -= pixelDy * mmPerPixel;
+            clampOffset();
+        }
+
+        private void clampOffset() {
+            if (!Float.isFinite(minX) || !Float.isFinite(maxX)) return;
+            float minOffX = -minX;
+            float maxOffX = BED_X - maxX;
+            float minOffY = -minY;
+            float maxOffY = BED_Y - maxY;
+            if (minOffX <= maxOffX)
+                offsetX = Math.max(minOffX, Math.min(maxOffX, offsetX));
+            if (minOffY <= maxOffY)
+                offsetY = Math.max(minOffY, Math.min(maxOffY, offsetY));
         }
 
         synchronized void setLayers(List<float[]> newLayers) {
             layers = newLayers;
             selectedLayer = Math.max(0, layers.size() - 1);
+            offsetX = 0f;
+            offsetY = 0f;
             computeBounds();
             rebuildBuffers();
         }
@@ -220,8 +356,13 @@ public class Gcode3DViewer extends GLSurfaceView {
         }
 
         private void computeBounds() {
-            float minX = Float.POSITIVE_INFINITY, minY = Float.POSITIVE_INFINITY, minZ = Float.POSITIVE_INFINITY;
-            float maxX = Float.NEGATIVE_INFINITY, maxY = Float.NEGATIVE_INFINITY, maxZ = Float.NEGATIVE_INFINITY;
+            minX = Float.POSITIVE_INFINITY;
+            minY = Float.POSITIVE_INFINITY;
+            minZ = Float.POSITIVE_INFINITY;
+            maxX = Float.NEGATIVE_INFINITY;
+            maxY = Float.NEGATIVE_INFINITY;
+            maxZ = Float.NEGATIVE_INFINITY;
+
             for (float[] layer : layers) {
                 for (int i = 0; i + 2 < layer.length; i += 3) {
                     minX = Math.min(minX, layer[i]); maxX = Math.max(maxX, layer[i]);
@@ -229,12 +370,47 @@ public class Gcode3DViewer extends GLSurfaceView {
                     minZ = Math.min(minZ, layer[i + 2]); maxZ = Math.max(maxZ, layer[i + 2]);
                 }
             }
-            if (!Float.isFinite(minX)) { minX = minY = minZ = -1; maxX = maxY = maxZ = 1; }
-            centerX = (minX + maxX) * 0.5f;
-            centerY = (minY + maxY) * 0.5f;
-            centerZ = (minZ + maxZ) * 0.5f;
-            float size = Math.max(maxX - minX, Math.max(maxY - minY, maxZ - minZ));
-            modelScale = size <= 0 ? 1f : 1.8f / size;
+
+            if (!Float.isFinite(minX)) {
+                minX = minY = minZ = 0f;
+                maxX = maxY = 1f;
+                maxZ = 1f;
+            }
+
+            originalCenterX = (minX + maxX) * 0.5f;
+            originalCenterY = (minY + maxY) * 0.5f;
+            worldCenterZ = Math.max(0f, maxZ * 0.5f);
+            float worldSize = Math.max(240f, Math.max(BED_X, Math.max(BED_Y, maxZ + 20f)));
+            worldScale = 1.75f / worldSize;
+            clampOffset();
+        }
+
+        private void buildBed() {
+            List<Float> v = new ArrayList<>();
+            addLine(v, 0, 0, 0, BED_X, 0, 0);
+            addLine(v, BED_X, 0, 0, BED_X, BED_Y, 0);
+            addLine(v, BED_X, BED_Y, 0, 0, BED_Y, 0);
+            addLine(v, 0, BED_Y, 0, 0, 0, 0);
+
+            for (float p = 20f; p < BED_X; p += 20f)
+                addLine(v, p, 0, 0, p, BED_Y, 0);
+            for (float p = 20f; p < BED_Y; p += 20f)
+                addLine(v, 0, p, 0, BED_X, p, 0);
+
+            addLine(v, 110, 0, 0.02f, 110, BED_Y, 0.02f);
+            addLine(v, 0, 110, 0.02f, BED_X, 110, 0.02f);
+
+            float[] data = new float[v.size()];
+            for (int i = 0; i < data.length; i++) data[i] = v.get(i);
+            bedBuffer = toBuffer(data);
+            bedVertices = data.length / 3;
+        }
+
+        private static void addLine(List<Float> v,
+                                    float x1, float y1, float z1,
+                                    float x2, float y2, float z2) {
+            v.add(x1); v.add(y1); v.add(z1);
+            v.add(x2); v.add(y2); v.add(z2);
         }
 
         private void rebuildBuffers() {
@@ -255,7 +431,8 @@ public class Gcode3DViewer extends GLSurfaceView {
         }
 
         private FloatBuffer toBuffer(float[] data) {
-            ByteBuffer bb = ByteBuffer.allocateDirect(Math.max(1, data.length) * 4).order(ByteOrder.nativeOrder());
+            ByteBuffer bb = ByteBuffer.allocateDirect(Math.max(1, data.length) * 4)
+                    .order(ByteOrder.nativeOrder());
             FloatBuffer fb = bb.asFloatBuffer();
             if (data.length > 0) fb.put(data);
             fb.position(0);
@@ -287,15 +464,26 @@ public class Gcode3DViewer extends GLSurfaceView {
             gl.glScalef(zoom, zoom, zoom);
             gl.glRotatef(rotX, 1, 0, 0);
             gl.glRotatef(rotY, 0, 1, 0);
-            gl.glScalef(modelScale, modelScale, modelScale);
-            gl.glTranslatef(-centerX, -centerY, -centerZ);
+            gl.glScalef(worldScale, worldScale, worldScale);
+            gl.glTranslatef(-110f, -110f, -worldCenterZ);
 
             gl.glEnableClientState(GL10.GL_VERTEX_ARRAY);
+
+            if (bedVertices > 0) {
+                bedBuffer.position(0);
+                gl.glVertexPointer(3, GL10.GL_FLOAT, 0, bedBuffer);
+                gl.glColor4f(0.42f, 0.45f, 0.50f, 1f);
+                gl.glLineWidth(1.2f);
+                gl.glDrawArrays(GL10.GL_LINES, 0, bedVertices);
+            }
+
+            gl.glPushMatrix();
+            gl.glTranslatef(offsetX, offsetY, 0f);
 
             if (lowerVertices > 0) {
                 lowerBuffer.position(0);
                 gl.glVertexPointer(3, GL10.GL_FLOAT, 0, lowerBuffer);
-                gl.glColor4f(0.10f, 0.55f, 0.95f, 0.65f);
+                gl.glColor4f(0.10f, 0.55f, 0.95f, 0.75f);
                 gl.glLineWidth(1.5f);
                 gl.glDrawArrays(GL10.GL_LINES, 0, lowerVertices);
             }
@@ -308,6 +496,7 @@ public class Gcode3DViewer extends GLSurfaceView {
                 gl.glDrawArrays(GL10.GL_LINES, 0, currentVertices);
             }
 
+            gl.glPopMatrix();
             gl.glDisableClientState(GL10.GL_VERTEX_ARRAY);
         }
     }

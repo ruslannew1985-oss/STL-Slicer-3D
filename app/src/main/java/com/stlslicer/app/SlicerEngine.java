@@ -7,8 +7,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.*;
 
 /**
- * Lightweight offline STL -> G-code slicer.
- * Intended for Creality Ender-3 V3 SE / PETG profile used by the app.
+ * Lightweight offline STL -> G-code slicer for Creality Ender-3 V3 SE.
  */
 public final class SlicerEngine {
 
@@ -21,19 +20,21 @@ public final class SlicerEngine {
         public double bedTemperature = 75;
         public double layerHeight = 0.20;
         public double printSpeed = 50;
-        public double infillPercent = 20;
+        public double infillPercent = 30;
         public double nozzleDiameter = 0.40;
         public double filamentDiameter = 1.75;
-        public int perimeterCount = 2;
+        public int perimeterCount = 3;
         public double travelSpeed = 150;
         public double extrusionMultiplier = 1.0;
         public double bedSizeX = 220;
         public double bedSizeY = 220;
+        public double modelCenterX = 110;
+        public double modelCenterY = 110;
 
-        // PETG defaults requested for this app.
-        public int bottomSolidLayers = 4;
-        public int fanStartLayer = 4;     // human layer number, starts from 1
-        public int fanSpeed = 255;        // full fan when enabled
+        public int bottomSolidLayers = 3;
+        public int topSolidLayers = 3;
+        public int fanStartLayer = 4;
+        public int fanSpeed = 255;
 
         public void validate() {
             if (layerHeight < 0.05 || layerHeight > 1.0)
@@ -49,13 +50,32 @@ public final class SlicerEngine {
             if (nozzleDiameter <= 0 || filamentDiameter <= 0)
                 throw new IllegalArgumentException("Неверный диаметр сопла или филамента");
             if (perimeterCount < 1 || perimeterCount > 10)
-                throw new IllegalArgumentException("Количество периметров должно быть 1–10");
+                throw new IllegalArgumentException("Периметры стенок: от 1 до 10");
             if (bottomSolidLayers < 0 || bottomSolidLayers > 50)
-                throw new IllegalArgumentException("Неверное количество нижних сплошных слоёв");
+                throw new IllegalArgumentException("Нижние сплошные слои: от 0 до 50");
+            if (topSolidLayers < 0 || topSolidLayers > 50)
+                throw new IllegalArgumentException("Верхние сплошные слои: от 0 до 50");
             if (fanStartLayer < 1)
                 throw new IllegalArgumentException("Слой включения вентилятора должен быть >= 1");
             if (fanSpeed < 0 || fanSpeed > 255)
                 throw new IllegalArgumentException("Скорость вентилятора должна быть 0–255");
+            if (bedSizeX <= 0 || bedSizeY <= 0)
+                throw new IllegalArgumentException("Неверный размер стола");
+            if (modelCenterX < 0 || modelCenterX > bedSizeX ||
+                    modelCenterY < 0 || modelCenterY > bedSizeY)
+                throw new IllegalArgumentException("Координаты детали должны быть внутри стола");
+        }
+    }
+
+    public static final class ModelInfo {
+        public final double width;
+        public final double depth;
+        public final double height;
+
+        ModelInfo(double width, double depth, double height) {
+            this.width = width;
+            this.depth = depth;
+            this.height = height;
         }
     }
 
@@ -63,6 +83,14 @@ public final class SlicerEngine {
     private static final double JOIN_TOLERANCE = 0.03;
 
     private SlicerEngine() {}
+
+    public static ModelInfo inspect(InputStream stlInput) throws IOException {
+        Mesh mesh = readStl(stlInput);
+        return new ModelInfo(
+                mesh.maxX - mesh.minX,
+                mesh.maxY - mesh.minY,
+                mesh.maxZ - mesh.minZ);
+    }
 
     public static void slice(InputStream stlInput,
                              OutputStream gcodeOutput,
@@ -77,18 +105,33 @@ public final class SlicerEngine {
 
         if (width <= EPS || depth <= EPS || height <= EPS)
             throw new IOException("STL имеет нулевой размер");
-        if (width > settings.bedSizeX - 10 || depth > settings.bedSizeY - 10)
+        if (width > settings.bedSizeX || depth > settings.bedSizeY)
             throw new IOException("Модель не помещается на стол 220×220 мм");
 
+        double sourceCenterX = (mesh.minX + mesh.maxX) / 2.0;
+        double sourceCenterY = (mesh.minY + mesh.maxY) / 2.0;
+        double shiftX = settings.modelCenterX - sourceCenterX;
+        double shiftY = settings.modelCenterY - sourceCenterY;
+
+        double placedMinX = mesh.minX + shiftX;
+        double placedMaxX = mesh.maxX + shiftX;
+        double placedMinY = mesh.minY + shiftY;
+        double placedMaxY = mesh.maxY + shiftY;
+        if (placedMinX < -EPS || placedMinY < -EPS ||
+                placedMaxX > settings.bedSizeX + EPS ||
+                placedMaxY > settings.bedSizeY + EPS) {
+            throw new IOException(String.format(Locale.US,
+                    "Деталь выходит за границы стола. Центр: X %.1f, Y %.1f мм",
+                    settings.modelCenterX, settings.modelCenterY));
+        }
+
         int layers = Math.max(1, (int)Math.ceil(height / settings.layerHeight));
-        double shiftX = settings.bedSizeX / 2.0 - (mesh.minX + mesh.maxX) / 2.0;
-        double shiftY = settings.bedSizeY / 2.0 - (mesh.minY + mesh.maxY) / 2.0;
         double filamentArea = Math.PI * settings.filamentDiameter * settings.filamentDiameter / 4.0;
         double lineWidth = settings.nozzleDiameter;
 
         BufferedWriter out = new BufferedWriter(
                 new OutputStreamWriter(gcodeOutput, StandardCharsets.US_ASCII), 64 * 1024);
-        writeHeader(out, settings, layers);
+        writeHeader(out, settings, layers, width, depth);
 
         double[] extrusion = {0.0};
 
@@ -103,10 +146,9 @@ public final class SlicerEngine {
             out.write("\n;LAYER:" + layerIndex + "\n");
             out.write(String.format(Locale.US, ";Z:%.3f%n", printerZ));
 
-            // Fan is deliberately off for the first three layers.
-            // Turn it on immediately before printing the requested layer.
             if (humanLayer == settings.fanStartLayer) {
-                out.write("M106 S" + settings.fanSpeed + " ; fan on from layer " + humanLayer + "\n");
+                out.write("M106 S" + settings.fanSpeed +
+                        " ; fan on from layer " + humanLayer + "\n");
             }
 
             out.write(String.format(Locale.US, "G0 Z%.3f F%.0f%n",
@@ -130,12 +172,13 @@ public final class SlicerEngine {
                     }
                 }
 
-                if (humanLayer <= settings.bottomSolidLayers) {
-                    // Dense skin on the bottom. Alternating direction between layers
-                    // closes the floor and makes it appear opaque in the 3D G-code view.
+                boolean bottomSkin = humanLayer <= settings.bottomSolidLayers;
+                boolean topSkin = humanLayer > layers - settings.topSolidLayers;
+
+                if (bottomSkin || topSkin) {
                     writeFill(out, loops, shiftX, shiftY, layerIndex,
                             settings, lineWidth, filamentArea, extrusion,
-                            1.0, ";TYPE:BOTTOM");
+                            1.0, bottomSkin ? ";TYPE:BOTTOM" : ";TYPE:TOP");
                 } else if (settings.infillPercent > 0.1) {
                     writeFill(out, loops, shiftX, shiftY, layerIndex,
                             settings, lineWidth, filamentArea, extrusion,
@@ -150,12 +193,22 @@ public final class SlicerEngine {
         out.flush();
     }
 
-    private static void writeHeader(BufferedWriter out, Settings s, int layers) throws IOException {
+    private static void writeHeader(BufferedWriter out,
+                                    Settings s,
+                                    int layers,
+                                    double width,
+                                    double depth) throws IOException {
         out.write("; STL Slicer 3D - offline Java slicer\n");
         out.write("; Printer: Creality Ender-3 V3 SE\n");
         out.write("; Material: PETG\n");
+        out.write("; Bed: 220x220 mm\n");
+        out.write(String.format(Locale.US, "; Model footprint: %.2f x %.2f mm%n", width, depth));
+        out.write(String.format(Locale.US, "; Model center: X%.2f Y%.2f%n", s.modelCenterX, s.modelCenterY));
         out.write("; Layers: " + layers + "\n");
+        out.write("; Walls/perimeters: " + s.perimeterCount + "\n");
         out.write("; Bottom solid layers: " + s.bottomSolidLayers + "\n");
+        out.write("; Top solid layers: " + s.topSolidLayers + "\n");
+        out.write(String.format(Locale.US, "; Infill: %.0f%%%n", s.infillPercent));
         out.write("; Fan starts at layer: " + s.fanStartLayer + "\n");
         out.write("G21 ; millimeters\n");
         out.write("G90 ; absolute XYZ\n");
@@ -243,7 +296,6 @@ public final class SlicerEngine {
                                   double density,
                                   String typeComment) throws IOException {
         density = Math.max(0.01, Math.min(1.0, density));
-        // Slight overlap for 100% bottom skin avoids visible gaps between lines.
         double spacing = density >= 0.999
                 ? Math.max(lineWidth * 0.90, 0.05)
                 : Math.max(lineWidth, lineWidth / density);
@@ -649,7 +701,7 @@ public final class SlicerEngine {
                 b.position(84);
 
                 for (int i = 0; i < count; i++) {
-                    b.position(b.position() + 12); // normal
+                    b.position(b.position() + 12);
                     int base = i * 11;
                     float minZ = Float.POSITIVE_INFINITY;
                     float maxZ = Float.NEGATIVE_INFINITY;

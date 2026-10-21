@@ -7,10 +7,13 @@ import android.net.Uri;
 import android.provider.OpenableColumns;
 import android.database.Cursor;
 import android.graphics.Color;
+import android.text.Editable;
+import android.text.TextWatcher;
 import android.view.View;
 import android.widget.*;
 
 import java.io.*;
+import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -19,14 +22,18 @@ public class MainActivity extends Activity {
     private static final int REQ_OPEN_STL = 10;
     private static final int REQ_SAVE_GCODE = 11;
 
-    private TextView fileInfo, status, layerLabel, gcodeHint;
+    private TextView fileInfo, status, layerLabel, gcodeHint, placementInfo;
     private EditText nozzle, bed, layer, speed, infill;
+    private EditText bottomLayers, topLayers, wallLines, fanLayer;
+    private EditText positionX, positionY;
     private Button sliceButton, resetGcodeView;
     private SeekBar layerSeek;
     private Uri selectedFile;
     private STLViewer stlViewer;
     private Gcode3DViewer gcodeViewer;
+    private BedPlacementView bedPlacement;
     private File generatedGcode;
+    private boolean syncingPlacement;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
 
     private EditText addField(LinearLayout root, String label, String value) {
@@ -40,6 +47,16 @@ public class MainActivity extends Activity {
         field.setText(value);
         root.addView(field);
         return field;
+    }
+
+    private TextView addSection(LinearLayout root, String title) {
+        TextView text = new TextView(this);
+        text.setText(title);
+        text.setTextSize(21);
+        text.setTextColor(Color.BLACK);
+        text.setPadding(0, 22, 0, 8);
+        root.addView(text);
+        return text;
     }
 
     @Override
@@ -60,7 +77,7 @@ public class MainActivity extends Activity {
         root.addView(title);
 
         TextView printer = new TextView(this);
-        printer.setText("Creality Ender-3 V3 SE | PETG | офлайн");
+        printer.setText("Creality Ender-3 V3 SE | PETG | стол 220×220 мм | офлайн");
         printer.setTextSize(17);
         root.addView(printer);
 
@@ -79,17 +96,38 @@ public class MainActivity extends Activity {
                 600
         ));
 
-        TextView settings = new TextView(this);
-        settings.setText("Параметры печати PETG");
-        settings.setTextSize(21);
-        settings.setTextColor(Color.BLACK);
-        root.addView(settings);
+        addSection(root, "Расположение детали на столе 220×220 мм");
+
+        placementInfo = new TextView(this);
+        placementInfo.setText("После загрузки STL здесь появится размер детали. Перетаскивайте её пальцем по столу.");
+        placementInfo.setTextSize(14);
+        root.addView(placementInfo);
+
+        bedPlacement = new BedPlacementView(this);
+        bedPlacement.setBedSize(220, 220);
+        root.addView(bedPlacement, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                700
+        ));
+
+        positionX = addField(root, "Центр детали X (мм)", "110");
+        positionY = addField(root, "Центр детали Y (мм)", "110");
+
+        Button centerButton = new Button(this);
+        centerButton.setText("ПО ЦЕНТРУ СТОЛА");
+        root.addView(centerButton);
+
+        addSection(root, "Параметры печати PETG");
 
         nozzle = addField(root, "Температура сопла (°C)", "235");
         bed = addField(root, "Температура стола (°C)", "75");
         layer = addField(root, "Высота слоя (мм)", "0.2");
         speed = addField(root, "Скорость печати (мм/с)", "50");
-        infill = addField(root, "Заполнение (%)", "20");
+        infill = addField(root, "Заполнение внутри (%)", "30");
+        bottomLayers = addField(root, "Сплошных нижних слоёв", "3");
+        topLayers = addField(root, "Сплошных верхних слоёв", "3");
+        wallLines = addField(root, "Периметры стенок (наружные + внутренние), линий", "3");
+        fanLayer = addField(root, "Вентилятор включить с слоя", "4");
 
         sliceButton = new Button(this);
         sliceButton.setText("СОЗДАТЬ G-CODE");
@@ -135,9 +173,38 @@ public class MainActivity extends Activity {
                 gcodeViewer.setLayer(progress);
                 layerLabel.setText("3D G-code: слой " + (progress + 1) + " из " + gcodeViewer.getLayerCount());
             }
-
             @Override public void onStartTrackingTouch(SeekBar seekBar) {}
             @Override public void onStopTrackingTouch(SeekBar seekBar) {}
+        });
+
+        bedPlacement.setOnPositionChangedListener((x, y) -> {
+            syncingPlacement = true;
+            positionX.setText(String.format(Locale.US, "%.1f", x));
+            positionY.setText(String.format(Locale.US, "%.1f", y));
+            syncingPlacement = false;
+        });
+
+        TextWatcher placementWatcher = new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {}
+            @Override public void afterTextChanged(Editable s) {
+                if (syncingPlacement) return;
+                try {
+                    double x = Double.parseDouble(positionX.getText().toString().trim().replace(',', '.'));
+                    double y = Double.parseDouble(positionY.getText().toString().trim().replace(',', '.'));
+                    bedPlacement.setCenter(x, y);
+                } catch (Exception ignored) {}
+            }
+        };
+        positionX.addTextChangedListener(placementWatcher);
+        positionY.addTextChangedListener(placementWatcher);
+
+        centerButton.setOnClickListener(v -> {
+            syncingPlacement = true;
+            positionX.setText("110");
+            positionY.setText("110");
+            syncingPlacement = false;
+            bedPlacement.setCenter(110, 110);
         });
 
         resetGcodeView.setOnClickListener(v -> gcodeViewer.resetView());
@@ -150,6 +217,28 @@ public class MainActivity extends Activity {
         intent.addCategory(Intent.CATEGORY_OPENABLE);
         intent.setType("*/*");
         startActivityForResult(intent, REQ_OPEN_STL);
+    }
+
+    private void inspectPlacement(Uri uri) {
+        worker.execute(() -> {
+            try (InputStream in = getContentResolver().openInputStream(uri)) {
+                if (in == null) throw new IOException("Не удалось открыть STL");
+                SlicerEngine.ModelInfo info = SlicerEngine.inspect(in);
+                runOnUiThread(() -> {
+                    bedPlacement.setModelSize(info.width, info.depth);
+                    bedPlacement.setCenter(110, 110);
+                    syncingPlacement = true;
+                    positionX.setText("110");
+                    positionY.setText("110");
+                    syncingPlacement = false;
+                    placementInfo.setText(String.format(Locale.US,
+                            "Размер детали: %.1f × %.1f мм, высота %.1f мм. Перетащите прямоугольник пальцем или задайте X/Y.",
+                            info.width, info.depth, info.height));
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> placementInfo.setText("Не удалось определить размеры STL: " + safeMessage(e)));
+            }
+        });
     }
 
     private void startSlicing() {
@@ -193,7 +282,7 @@ public class MainActivity extends Activity {
                 runOnUiThread(() -> {
                     sliceButton.setEnabled(true);
                     showGcodePreview(previewLayers);
-                    status.setText("G-code готов. Проверьте объёмную модель по слоям и сохраните файл.");
+                    status.setText("G-code готов. Проверьте расположение и модель по слоям, затем сохраните файл.");
                     askWhereToSave();
                 });
             } catch (Exception e) {
@@ -239,14 +328,20 @@ public class MainActivity extends Activity {
         s.layerHeight = parseNumber(layer, "высота слоя");
         s.printSpeed = parseNumber(speed, "скорость");
         s.infillPercent = parseNumber(infill, "заполнение");
+        s.bottomSolidLayers = parseInteger(bottomLayers, "нижние слои");
+        s.topSolidLayers = parseInteger(topLayers, "верхние слои");
+        s.perimeterCount = parseInteger(wallLines, "периметры стенок");
+        s.fanStartLayer = parseInteger(fanLayer, "слой включения вентилятора");
+        s.modelCenterX = parseNumber(positionX, "позиция X");
+        s.modelCenterY = parseNumber(positionY, "позиция Y");
 
         s.nozzleDiameter = 0.4;
         s.filamentDiameter = 1.75;
-        s.perimeterCount = 2;
         s.travelSpeed = 150;
         s.extrusionMultiplier = 1.0;
         s.bedSizeX = 220;
         s.bedSizeY = 220;
+        s.fanSpeed = 255;
         return s;
     }
 
@@ -257,6 +352,16 @@ public class MainActivity extends Activity {
             return Double.parseDouble(text);
         } catch (NumberFormatException e) {
             throw new IllegalArgumentException("неверное число: " + name);
+        }
+    }
+
+    private int parseInteger(EditText field, String name) {
+        String text = field.getText().toString().trim();
+        if (text.isEmpty()) throw new IllegalArgumentException("не заполнено поле: " + name);
+        try {
+            return Integer.parseInt(text);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("нужно целое число: " + name);
         }
     }
 
@@ -362,6 +467,8 @@ public class MainActivity extends Activity {
             selectedFile = uri;
             generatedGcode = null;
             hideGcodePreview();
+            bedPlacement.setModelSize(0, 0);
+            placementInfo.setText("Определяю размер детали...");
 
             try {
                 int flags = data.getFlags() &
@@ -375,7 +482,8 @@ public class MainActivity extends Activity {
 
             try {
                 stlViewer.loadSTL(uri);
-                status.setText("3D-модель загружена. Вращайте пальцем или создайте G-code.");
+                status.setText("3D-модель загружена. Разместите её на столе и задайте параметры печати.");
+                inspectPlacement(uri);
             } catch (Exception e) {
                 selectedFile = null;
                 fileInfo.setText("Ошибка открытия STL");

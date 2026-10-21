@@ -7,33 +7,34 @@ import android.net.Uri;
 import android.provider.OpenableColumns;
 import android.database.Cursor;
 import android.graphics.Color;
-import android.text.Editable;
-import android.text.TextWatcher;
 import android.view.View;
 import android.widget.*;
 
 import java.io.*;
+import java.nio.charset.StandardCharsets;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class MainActivity extends Activity {
 
     private static final int REQ_OPEN_STL = 10;
     private static final int REQ_SAVE_GCODE = 11;
+    private static final Pattern XY_TOKEN = Pattern.compile(
+            "(?i)([XY])\\s*([-+]?(?:\\d+(?:\\.\\d*)?|\\.\\d+)(?:[eE][-+]?\\d+)?)");
 
-    private TextView fileInfo, status, layerLabel, gcodeHint, placementInfo;
+    private TextView fileInfo, status, layerLabel, gcodeHint, gcodePosition;
     private EditText nozzle, bed, layer, speed, infill;
     private EditText bottomLayers, topLayers, wallLines, fanLayer;
-    private EditText positionX, positionY;
-    private Button sliceButton, resetGcodeView;
+    private Button sliceButton, resetGcodeView, placementModeButton;
+    private Button centerGcodeButton, saveGcodeButton;
     private SeekBar layerSeek;
     private Uri selectedFile;
     private STLViewer stlViewer;
     private Gcode3DViewer gcodeViewer;
-    private BedPlacementView bedPlacement;
     private File generatedGcode;
-    private boolean syncingPlacement;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
 
     private EditText addField(LinearLayout root, String label, String value) {
@@ -96,27 +97,6 @@ public class MainActivity extends Activity {
                 600
         ));
 
-        addSection(root, "Расположение детали на столе 220×220 мм");
-
-        placementInfo = new TextView(this);
-        placementInfo.setText("После загрузки STL здесь появится размер детали. Перетаскивайте её пальцем по столу.");
-        placementInfo.setTextSize(14);
-        root.addView(placementInfo);
-
-        bedPlacement = new BedPlacementView(this);
-        bedPlacement.setBedSize(220, 220);
-        root.addView(bedPlacement, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                700
-        ));
-
-        positionX = addField(root, "Центр детали X (мм)", "110");
-        positionY = addField(root, "Центр детали Y (мм)", "110");
-
-        Button centerButton = new Button(this);
-        centerButton.setText("ПО ЦЕНТРУ СТОЛА");
-        root.addView(centerButton);
-
         addSection(root, "Параметры печати PETG");
 
         nozzle = addField(root, "Температура сопла (°C)", "235");
@@ -138,6 +118,8 @@ public class MainActivity extends Activity {
         status.setTextSize(16);
         root.addView(status);
 
+        addSection(root, "Готовый G-code на столе 220×220 мм");
+
         layerLabel = new TextView(this);
         layerLabel.setText("3D-просмотр G-code");
         layerLabel.setTextSize(20);
@@ -146,14 +128,31 @@ public class MainActivity extends Activity {
         root.addView(layerLabel);
 
         gcodeHint = new TextView(this);
-        gcodeHint.setText("Вращение — одним пальцем. Масштаб — двумя пальцами. Ползунок показывает модель до выбранного слоя.");
+        gcodeHint.setText("После слайсинга здесь появится стол. Сначала расположите готовый G-code, затем сохраните файл.");
         gcodeHint.setTextSize(14);
         gcodeHint.setVisibility(View.GONE);
         root.addView(gcodeHint);
 
+        gcodePosition = new TextView(this);
+        gcodePosition.setText("Центр G-code: X110.0 Y110.0 мм");
+        gcodePosition.setTextSize(16);
+        gcodePosition.setTextColor(Color.BLACK);
+        gcodePosition.setVisibility(View.GONE);
+        root.addView(gcodePosition);
+
         layerSeek = new SeekBar(this);
         layerSeek.setVisibility(View.GONE);
         root.addView(layerSeek);
+
+        placementModeButton = new Button(this);
+        placementModeButton.setText("РАЗМЕСТИТЬ НА СТОЛЕ");
+        placementModeButton.setVisibility(View.GONE);
+        root.addView(placementModeButton);
+
+        centerGcodeButton = new Button(this);
+        centerGcodeButton.setText("ПО ЦЕНТРУ СТОЛА");
+        centerGcodeButton.setVisibility(View.GONE);
+        root.addView(centerGcodeButton);
 
         resetGcodeView = new Button(this);
         resetGcodeView.setText("СБРОСИТЬ 3D-ВИД");
@@ -164,50 +163,48 @@ public class MainActivity extends Activity {
         gcodeViewer.setVisibility(View.GONE);
         root.addView(gcodeViewer, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
-                760
+                780
         ));
+
+        saveGcodeButton = new Button(this);
+        saveGcodeButton.setText("СОХРАНИТЬ ГОТОВЫЙ G-CODE");
+        saveGcodeButton.setVisibility(View.GONE);
+        root.addView(saveGcodeButton);
 
         layerSeek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
                 gcodeViewer.setLayer(progress);
-                layerLabel.setText("3D G-code: слой " + (progress + 1) + " из " + gcodeViewer.getLayerCount());
+                layerLabel.setText("3D G-code: слой " + (progress + 1) +
+                        " из " + gcodeViewer.getLayerCount());
             }
             @Override public void onStartTrackingTouch(SeekBar seekBar) {}
             @Override public void onStopTrackingTouch(SeekBar seekBar) {}
         });
 
-        bedPlacement.setOnPositionChangedListener((x, y) -> {
-            syncingPlacement = true;
-            positionX.setText(String.format(Locale.US, "%.1f", x));
-            positionY.setText(String.format(Locale.US, "%.1f", y));
-            syncingPlacement = false;
-        });
+        gcodeViewer.setOnPlacementChangedListener((x, y) -> runOnUiThread(() ->
+                gcodePosition.setText(String.format(Locale.US,
+                        "Центр G-code: X%.1f  Y%.1f мм", x, y))));
 
-        TextWatcher placementWatcher = new TextWatcher() {
-            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
-            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {}
-            @Override public void afterTextChanged(Editable s) {
-                if (syncingPlacement) return;
-                try {
-                    double x = Double.parseDouble(positionX.getText().toString().trim().replace(',', '.'));
-                    double y = Double.parseDouble(positionY.getText().toString().trim().replace(',', '.'));
-                    bedPlacement.setCenter(x, y);
-                } catch (Exception ignored) {}
+        placementModeButton.setOnClickListener(v -> {
+            boolean enable = !gcodeViewer.isPlacementMode();
+            gcodeViewer.setPlacementMode(enable);
+            if (enable) {
+                placementModeButton.setText("ГОТОВО — ВЕРНУТЬСЯ В 3D");
+                gcodeHint.setText("Режим размещения: вид сверху. Двигайте готовую деталь одним пальцем по столу. Масштаб — двумя пальцами.");
+            } else {
+                placementModeButton.setText("РАЗМЕСТИТЬ НА СТОЛЕ");
+                gcodeHint.setText("3D-режим: вращение одним пальцем, масштаб двумя. Кнопка «Разместить на столе» возвращает вид сверху.");
             }
-        };
-        positionX.addTextChangedListener(placementWatcher);
-        positionY.addTextChangedListener(placementWatcher);
-
-        centerButton.setOnClickListener(v -> {
-            syncingPlacement = true;
-            positionX.setText("110");
-            positionY.setText("110");
-            syncingPlacement = false;
-            bedPlacement.setCenter(110, 110);
         });
 
-        resetGcodeView.setOnClickListener(v -> gcodeViewer.resetView());
+        centerGcodeButton.setOnClickListener(v -> gcodeViewer.centerOnBed());
+        resetGcodeView.setOnClickListener(v -> {
+            gcodeViewer.resetView();
+            placementModeButton.setText("РАЗМЕСТИТЬ НА СТОЛЕ");
+            gcodeHint.setText("3D-режим: вращение одним пальцем, масштаб двумя. Кнопка «Разместить на столе» возвращает вид сверху.");
+        });
+        saveGcodeButton.setOnClickListener(v -> askWhereToSave());
         open.setOnClickListener(v -> openStl());
         sliceButton.setOnClickListener(v -> startSlicing());
     }
@@ -217,28 +214,6 @@ public class MainActivity extends Activity {
         intent.addCategory(Intent.CATEGORY_OPENABLE);
         intent.setType("*/*");
         startActivityForResult(intent, REQ_OPEN_STL);
-    }
-
-    private void inspectPlacement(Uri uri) {
-        worker.execute(() -> {
-            try (InputStream in = getContentResolver().openInputStream(uri)) {
-                if (in == null) throw new IOException("Не удалось открыть STL");
-                SlicerEngine.ModelInfo info = SlicerEngine.inspect(in);
-                runOnUiThread(() -> {
-                    bedPlacement.setModelSize(info.width, info.depth);
-                    bedPlacement.setCenter(110, 110);
-                    syncingPlacement = true;
-                    positionX.setText("110");
-                    positionY.setText("110");
-                    syncingPlacement = false;
-                    placementInfo.setText(String.format(Locale.US,
-                            "Размер детали: %.1f × %.1f мм, высота %.1f мм. Перетащите прямоугольник пальцем или задайте X/Y.",
-                            info.width, info.depth, info.height));
-                });
-            } catch (Exception e) {
-                runOnUiThread(() -> placementInfo.setText("Не удалось определить размеры STL: " + safeMessage(e)));
-            }
-        });
     }
 
     private void startSlicing() {
@@ -268,11 +243,12 @@ public class MainActivity extends Activity {
                 if (in == null) throw new IOException("Не удалось открыть STL");
 
                 SlicerEngine.slice(in, out, settings, (current, total) -> {
-                    if (current == 1 || current == total || current % Math.max(1, total / 20) == 0) {
+                    if (current == 1 || current == total ||
+                            current % Math.max(1, total / 20) == 0) {
                         int percent = (int)Math.round(current * 100.0 / total);
-                        runOnUiThread(() ->
-                                status.setText("Слайсинг: " + percent + "% (" + current + "/" + total + " слоёв)")
-                        );
+                        runOnUiThread(() -> status.setText(
+                                "Слайсинг: " + percent + "% (" + current +
+                                        "/" + total + " слоёв)"));
                     }
                 });
 
@@ -282,8 +258,7 @@ public class MainActivity extends Activity {
                 runOnUiThread(() -> {
                     sliceButton.setEnabled(true);
                     showGcodePreview(previewLayers);
-                    status.setText("G-code готов. Проверьте расположение и модель по слоям, затем сохраните файл.");
-                    askWhereToSave();
+                    status.setText("G-code готов. Расположите уже нарезанную деталь на столе и только потом нажмите «Сохранить готовый G-code».");
                 });
             } catch (Exception e) {
                 if (temp.exists()) temp.delete();
@@ -301,24 +276,41 @@ public class MainActivity extends Activity {
             hideGcodePreview();
             return;
         }
+
         int last = count - 1;
         layerSeek.setMax(last);
         layerSeek.setProgress(last);
         gcodeViewer.setLayer(last);
+        gcodeViewer.setPlacementMode(true);
+
         layerLabel.setText("3D G-code: слой " + count + " из " + count);
+        gcodePosition.setText(String.format(Locale.US,
+                "Центр G-code: X%.1f  Y%.1f мм",
+                gcodeViewer.getModelCenterX(), gcodeViewer.getModelCenterY()));
+        placementModeButton.setText("ГОТОВО — ВЕРНУТЬСЯ В 3D");
+        gcodeHint.setText("Режим размещения: вид сверху. Двигайте готовую деталь одним пальцем по столу. Масштаб — двумя пальцами.");
+
         layerLabel.setVisibility(View.VISIBLE);
         gcodeHint.setVisibility(View.VISIBLE);
+        gcodePosition.setVisibility(View.VISIBLE);
         layerSeek.setVisibility(View.VISIBLE);
+        placementModeButton.setVisibility(View.VISIBLE);
+        centerGcodeButton.setVisibility(View.VISIBLE);
         resetGcodeView.setVisibility(View.VISIBLE);
         gcodeViewer.setVisibility(View.VISIBLE);
+        saveGcodeButton.setVisibility(View.VISIBLE);
     }
 
     private void hideGcodePreview() {
         layerLabel.setVisibility(View.GONE);
         gcodeHint.setVisibility(View.GONE);
+        gcodePosition.setVisibility(View.GONE);
         layerSeek.setVisibility(View.GONE);
+        placementModeButton.setVisibility(View.GONE);
+        centerGcodeButton.setVisibility(View.GONE);
         resetGcodeView.setVisibility(View.GONE);
         gcodeViewer.setVisibility(View.GONE);
+        saveGcodeButton.setVisibility(View.GONE);
     }
 
     private SlicerEngine.Settings readSettings() {
@@ -332,9 +324,11 @@ public class MainActivity extends Activity {
         s.topSolidLayers = parseInteger(topLayers, "верхние слои");
         s.perimeterCount = parseInteger(wallLines, "периметры стенок");
         s.fanStartLayer = parseInteger(fanLayer, "слой включения вентилятора");
-        s.modelCenterX = parseNumber(positionX, "позиция X");
-        s.modelCenterY = parseNumber(positionY, "позиция Y");
 
+        // Нарезка всегда начинается по центру стола. После слайсинга пользователь
+        // двигает уже готовый G-code, и смещение записывается при сохранении.
+        s.modelCenterX = 110;
+        s.modelCenterY = 110;
         s.nozzleDiameter = 0.4;
         s.filamentDiameter = 1.75;
         s.travelSpeed = 150;
@@ -347,7 +341,8 @@ public class MainActivity extends Activity {
 
     private double parseNumber(EditText field, String name) {
         String text = field.getText().toString().trim().replace(',', '.');
-        if (text.isEmpty()) throw new IllegalArgumentException("не заполнено поле: " + name);
+        if (text.isEmpty())
+            throw new IllegalArgumentException("не заполнено поле: " + name);
         try {
             return Double.parseDouble(text);
         } catch (NumberFormatException e) {
@@ -357,7 +352,8 @@ public class MainActivity extends Activity {
 
     private int parseInteger(EditText field, String name) {
         String text = field.getText().toString().trim();
-        if (text.isEmpty()) throw new IllegalArgumentException("не заполнено поле: " + name);
+        if (text.isEmpty())
+            throw new IllegalArgumentException("не заполнено поле: " + name);
         try {
             return Integer.parseInt(text);
         } catch (NumberFormatException e) {
@@ -423,37 +419,107 @@ public class MainActivity extends Activity {
             return;
         }
 
-        status.setText("Сохранение G-code...");
+        final double shiftX = gcodeViewer.getOffsetX();
+        final double shiftY = gcodeViewer.getOffsetY();
+        final double centerX = gcodeViewer.getModelCenterX();
+        final double centerY = gcodeViewer.getModelCenterY();
+
+        status.setText("Сохранение G-code с выбранным положением на столе...");
         worker.execute(() -> {
-            try (InputStream in = new BufferedInputStream(new FileInputStream(generatedGcode));
-                 OutputStream out = getContentResolver().openOutputStream(destination, "w")) {
+            try (OutputStream raw = getContentResolver().openOutputStream(destination, "w")) {
+                if (raw == null)
+                    throw new IOException("Не удалось открыть место сохранения");
 
-                if (out == null) throw new IOException("Не удалось открыть место сохранения");
-
-                byte[] buffer = new byte[64 * 1024];
-                int n;
-                while ((n = in.read(buffer)) != -1) out.write(buffer, 0, n);
-                out.flush();
+                writePlacedGcode(generatedGcode, raw, shiftX, shiftY);
+                raw.flush();
 
                 String savedName = getDisplayName(destination);
                 runOnUiThread(() -> {
-                    if (savedName != null && savedName.toLowerCase().endsWith(".gcode")) {
-                        status.setText("Готово: " + savedName + ". 3D-просмотр остаётся доступен ниже.");
-                    } else {
-                        status.setText("G-code сохранён. 3D-просмотр остаётся доступен ниже.");
-                    }
+                    String base = savedName != null ? savedName : "G-code";
+                    status.setText(String.format(Locale.US,
+                            "Готово: %s. Положение на столе сохранено: X%.1f Y%.1f мм.",
+                            base, centerX, centerY));
                 });
             } catch (Exception e) {
-                runOnUiThread(() ->
-                        status.setText("Ошибка сохранения: " + safeMessage(e))
-                );
+                runOnUiThread(() -> status.setText(
+                        "Ошибка сохранения: " + safeMessage(e)));
             }
         });
     }
 
+    private void writePlacedGcode(File source,
+                                  OutputStream destination,
+                                  double shiftX,
+                                  double shiftY) throws IOException {
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(
+                     new FileInputStream(source), StandardCharsets.US_ASCII), 64 * 1024);
+             BufferedWriter bw = new BufferedWriter(new OutputStreamWriter(
+                     destination, StandardCharsets.US_ASCII), 64 * 1024)) {
+
+            bw.write(String.format(Locale.US,
+                    "; Final bed placement offset: X%.3f Y%.3f mm%n",
+                    shiftX, shiftY));
+
+            boolean absoluteXYZ = true;
+            String line;
+            while ((line = br.readLine()) != null) {
+                String command = firstWord(line).toUpperCase(Locale.US);
+
+                if (command.equals("G90")) {
+                    absoluteXYZ = true;
+                } else if (command.equals("G91")) {
+                    absoluteXYZ = false;
+                } else if (absoluteXYZ && (command.equals("G0") || command.equals("G00") ||
+                        command.equals("G1") || command.equals("G01"))) {
+                    line = shiftXY(line, shiftX, shiftY);
+                }
+
+                bw.write(line);
+                bw.newLine();
+            }
+            bw.flush();
+        }
+    }
+
+    private String shiftXY(String line, double dx, double dy) {
+        int commentAt = line.indexOf(';');
+        String code = commentAt >= 0 ? line.substring(0, commentAt) : line;
+        String comment = commentAt >= 0 ? line.substring(commentAt) : "";
+
+        Matcher m = XY_TOKEN.matcher(code);
+        StringBuffer out = new StringBuffer();
+        while (m.find()) {
+            char axis = Character.toUpperCase(m.group(1).charAt(0));
+            double value;
+            try {
+                value = Double.parseDouble(m.group(2));
+            } catch (NumberFormatException e) {
+                continue;
+            }
+            value += axis == 'X' ? dx : dy;
+            String replacement = axis + String.format(Locale.US, "%.3f", value);
+            m.appendReplacement(out, Matcher.quoteReplacement(replacement));
+        }
+        m.appendTail(out);
+        return out.toString() + comment;
+    }
+
+    private String firstWord(String line) {
+        String t = line.trim();
+        if (t.isEmpty() || t.startsWith(";")) return "";
+        int space = t.indexOf(' ');
+        int tab = t.indexOf('\t');
+        int end;
+        if (space < 0) end = tab;
+        else if (tab < 0) end = space;
+        else end = Math.min(space, tab);
+        return end < 0 ? t : t.substring(0, end);
+    }
+
     private String safeMessage(Throwable e) {
         String msg = e.getMessage();
-        return (msg == null || msg.trim().isEmpty()) ? e.getClass().getSimpleName() : msg;
+        return (msg == null || msg.trim().isEmpty())
+                ? e.getClass().getSimpleName() : msg;
     }
 
     @Override
@@ -467,13 +533,13 @@ public class MainActivity extends Activity {
             selectedFile = uri;
             generatedGcode = null;
             hideGcodePreview();
-            bedPlacement.setModelSize(0, 0);
-            placementInfo.setText("Определяю размер детали...");
 
             try {
                 int flags = data.getFlags() &
-                        (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
-                getContentResolver().takePersistableUriPermission(uri, flags & Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                        (Intent.FLAG_GRANT_READ_URI_PERMISSION |
+                                Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                getContentResolver().takePersistableUriPermission(
+                        uri, flags & Intent.FLAG_GRANT_READ_URI_PERMISSION);
             } catch (Exception ignored) {
             }
 
@@ -482,8 +548,7 @@ public class MainActivity extends Activity {
 
             try {
                 stlViewer.loadSTL(uri);
-                status.setText("3D-модель загружена. Разместите её на столе и задайте параметры печати.");
-                inspectPlacement(uri);
+                status.setText("3D-модель загружена. Задайте параметры печати и создайте G-code.");
             } catch (Exception e) {
                 selectedFile = null;
                 fileInfo.setText("Ошибка открытия STL");

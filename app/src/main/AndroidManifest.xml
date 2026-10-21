@@ -3,6 +3,8 @@
 
     <application
         android:label="STL Slicer 3D"
+        android:icon="@drawable/ic_launcher"
+        android:roundIcon="@drawable/ic_launcher"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
 
         <activity

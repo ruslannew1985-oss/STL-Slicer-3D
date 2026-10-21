@@ -1,6 +1,7 @@
 package com.stlslicer.app;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.os.Bundle;
 import android.content.Intent;
 import android.net.Uri;
@@ -12,6 +13,7 @@ import android.widget.*;
 
 import java.io.*;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -20,8 +22,9 @@ import java.util.regex.Pattern;
 
 public class MainActivity extends Activity {
 
-    private static final int REQ_OPEN_STL = 10;
+    private static final int REQ_OPEN_MODEL = 10;
     private static final int REQ_SAVE_GCODE = 11;
+    private static final long MAX_IMPORT_BYTES = 150L * 1024L * 1024L;
     private static final Pattern XY_TOKEN = Pattern.compile(
             "(?i)([XY])\\s*([-+]?(?:\\d+(?:\\.\\d*)?|\\.\\d+)(?:[eE][-+]?\\d+)?)");
 
@@ -31,9 +34,10 @@ public class MainActivity extends Activity {
     private Button sliceButton, resetGcodeView, placementModeButton;
     private Button centerGcodeButton, saveGcodeButton;
     private SeekBar layerSeek;
-    private Uri selectedFile;
     private STLViewer stlViewer;
     private Gcode3DViewer gcodeViewer;
+    private File selectedModelFile;
+    private String selectedModelName;
     private File generatedGcode;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
 
@@ -83,7 +87,7 @@ public class MainActivity extends Activity {
         root.addView(printer);
 
         Button open = new Button(this);
-        open.setText("ОТКРЫТЬ STL");
+        open.setText("ОТКРЫТЬ STL / 3MF / ZIP");
         root.addView(open);
 
         fileInfo = new TextView(this);
@@ -114,7 +118,7 @@ public class MainActivity extends Activity {
         root.addView(sliceButton);
 
         status = new TextView(this);
-        status.setText("Ожидание STL-файла");
+        status.setText("Ожидание модели STL / 3MF / ZIP");
         status.setTextSize(16);
         root.addView(status);
 
@@ -194,7 +198,7 @@ public class MainActivity extends Activity {
                 gcodeHint.setText("Режим размещения: вид сверху. Двигайте готовую деталь одним пальцем по столу. Масштаб — двумя пальцами.");
             } else {
                 placementModeButton.setText("РАЗМЕСТИТЬ НА СТОЛЕ");
-                gcodeHint.setText("3D-режим: вращение одним пальцем, масштаб двумя. Кнопка «Разместить на столе» возвращает вид сверху.");
+                gcodeHint.setText("3D-режим: вращение одним пальцем, масштаб двумя. Внутренние траектории видны сквозь внешние стенки.");
             }
         });
 
@@ -202,23 +206,183 @@ public class MainActivity extends Activity {
         resetGcodeView.setOnClickListener(v -> {
             gcodeViewer.resetView();
             placementModeButton.setText("РАЗМЕСТИТЬ НА СТОЛЕ");
-            gcodeHint.setText("3D-режим: вращение одним пальцем, масштаб двумя. Кнопка «Разместить на столе» возвращает вид сверху.");
+            gcodeHint.setText("3D-режим: вращение одним пальцем, масштаб двумя. Внутренние траектории видны сквозь внешние стенки.");
         });
         saveGcodeButton.setOnClickListener(v -> askWhereToSave());
-        open.setOnClickListener(v -> openStl());
+        open.setOnClickListener(v -> openModel());
         sliceButton.setOnClickListener(v -> startSlicing());
+
+        if (savedInstanceState == null) handleIncomingIntent(getIntent());
     }
 
-    private void openStl() {
+    private void openModel() {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
         intent.setType("*/*");
-        startActivityForResult(intent, REQ_OPEN_STL);
+        intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[] {
+                "model/stl", "model/3mf", "application/sla",
+                "application/vnd.ms-pki.stl", "application/zip",
+                "application/x-zip-compressed", "application/octet-stream"
+        });
+        startActivityForResult(intent, REQ_OPEN_MODEL);
+    }
+
+    private void handleIncomingIntent(Intent intent) {
+        if (intent == null) return;
+        Uri uri = null;
+        String action = intent.getAction();
+        if (Intent.ACTION_VIEW.equals(action)) {
+            uri = intent.getData();
+        } else if (Intent.ACTION_SEND.equals(action)) {
+            try {
+                uri = (Uri) intent.getParcelableExtra(Intent.EXTRA_STREAM);
+            } catch (Exception ignored) {}
+        }
+        if (uri != null) processModelUri(uri);
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleIncomingIntent(intent);
+    }
+
+    private void processModelUri(Uri uri) {
+        String foundName = getDisplayName(uri);
+        final String displayName = foundName != null
+                ? foundName
+                : (uri.getLastPathSegment() == null ? "model" : uri.getLastPathSegment());
+        final String mime = getContentResolver().getType(uri);
+
+        status.setText("Открываю: " + displayName + "...");
+        sliceButton.setEnabled(false);
+        hideGcodePreview();
+        selectedModelFile = null;
+        selectedModelName = null;
+        generatedGcode = null;
+
+        worker.execute(() -> {
+            try {
+                File local = copyUriToCache(uri, displayName);
+                String lower = displayName.toLowerCase(Locale.US);
+
+                boolean is3mf = lower.endsWith(".3mf") || "model/3mf".equalsIgnoreCase(mime);
+                boolean isZip = lower.endsWith(".zip") ||
+                        "application/zip".equalsIgnoreCase(mime) ||
+                        "application/x-zip-compressed".equalsIgnoreCase(mime);
+
+                if (!is3mf && !isZip && looksLikeZip(local)) {
+                    if (ModelFileLoader.is3mfPackage(local)) is3mf = true;
+                    else isZip = true;
+                }
+
+                if (isZip && !is3mf) {
+                    List<String> models = ModelFileLoader.listArchiveModels(local);
+                    if (models.isEmpty()) throw new IOException("В ZIP нет файлов STL или 3MF");
+                    if (models.size() > 1) {
+                        showArchiveChoices(local, models);
+                        return;
+                    }
+                    ModelFileLoader.PreparedModel prepared =
+                            ModelFileLoader.prepareArchiveEntry(local, models.get(0), getCacheDir());
+                    loadPreparedModel(prepared);
+                    return;
+                }
+
+                ModelFileLoader.PreparedModel prepared =
+                        ModelFileLoader.prepare(local, displayName, getCacheDir());
+                loadPreparedModel(prepared);
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    sliceButton.setEnabled(true);
+                    selectedModelFile = null;
+                    selectedModelName = null;
+                    fileInfo.setText("Ошибка открытия файла");
+                    status.setText("Не удалось открыть модель: " + safeMessage(e));
+                });
+            }
+        });
+    }
+
+    private void showArchiveChoices(File archive, List<String> models) {
+        runOnUiThread(() -> {
+            sliceButton.setEnabled(true);
+            String[] items = models.toArray(new String[0]);
+            new AlertDialog.Builder(this)
+                    .setTitle("Выберите модель из ZIP")
+                    .setItems(items, (dialog, which) -> {
+                        status.setText("Извлекаю: " + items[which] + "...");
+                        sliceButton.setEnabled(false);
+                        worker.execute(() -> {
+                            try {
+                                ModelFileLoader.PreparedModel prepared =
+                                        ModelFileLoader.prepareArchiveEntry(
+                                                archive, models.get(which), getCacheDir());
+                                loadPreparedModel(prepared);
+                            } catch (Exception e) {
+                                runOnUiThread(() -> {
+                                    sliceButton.setEnabled(true);
+                                    status.setText("Ошибка ZIP: " + safeMessage(e));
+                                });
+                            }
+                        });
+                    })
+                    .setNegativeButton("Отмена", null)
+                    .show();
+        });
+    }
+
+    private void loadPreparedModel(ModelFileLoader.PreparedModel prepared) throws IOException {
+        stlViewer.loadSTL(Uri.fromFile(prepared.stlFile));
+        selectedModelFile = prepared.stlFile;
+        selectedModelName = prepared.displayName;
+        generatedGcode = null;
+
+        runOnUiThread(() -> {
+            sliceButton.setEnabled(true);
+            hideGcodePreview();
+            fileInfo.setText(prepared.displayName);
+            status.setText("Модель загружена. Задайте параметры печати и создайте G-code.");
+        });
+    }
+
+    private File copyUriToCache(Uri uri, String displayName) throws IOException {
+        String suffix = ".bin";
+        String lower = displayName.toLowerCase(Locale.US);
+        if (lower.endsWith(".stl")) suffix = ".stl";
+        else if (lower.endsWith(".3mf")) suffix = ".3mf";
+        else if (lower.endsWith(".zip")) suffix = ".zip";
+
+        File outFile = new File(getCacheDir(), "import_" + System.nanoTime() + suffix);
+        try (InputStream in = getContentResolver().openInputStream(uri);
+             OutputStream out = new BufferedOutputStream(new FileOutputStream(outFile))) {
+            if (in == null) throw new IOException("Не удалось прочитать файл");
+            byte[] buffer = new byte[64 * 1024];
+            long total = 0;
+            int n;
+            while ((n = in.read(buffer)) != -1) {
+                total += n;
+                if (total > MAX_IMPORT_BYTES) throw new IOException("Файл больше 150 МБ");
+                out.write(buffer, 0, n);
+            }
+        }
+        return outFile;
+    }
+
+    private boolean looksLikeZip(File file) {
+        try (InputStream in = new FileInputStream(file)) {
+            int a = in.read();
+            int b = in.read();
+            return a == 'P' && b == 'K';
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     private void startSlicing() {
-        if (selectedFile == null) {
-            status.setText("Сначала выберите STL-файл");
+        if (selectedModelFile == null || !selectedModelFile.exists()) {
+            status.setText("Сначала выберите STL, 3MF или ZIP с моделью");
             return;
         }
 
@@ -237,10 +401,8 @@ public class MainActivity extends Activity {
 
         worker.execute(() -> {
             File temp = new File(getCacheDir(), "stl_slicer_output.gcode");
-            try (InputStream in = getContentResolver().openInputStream(selectedFile);
+            try (InputStream in = new BufferedInputStream(new FileInputStream(selectedModelFile));
                  OutputStream out = new BufferedOutputStream(new FileOutputStream(temp))) {
-
-                if (in == null) throw new IOException("Не удалось открыть STL");
 
                 SlicerEngine.slice(in, out, settings, (current, total) -> {
                     if (current == 1 || current == total ||
@@ -325,8 +487,6 @@ public class MainActivity extends Activity {
         s.perimeterCount = parseInteger(wallLines, "периметры стенок");
         s.fanStartLayer = parseInteger(fanLayer, "слой включения вентилятора");
 
-        // Нарезка всегда начинается по центру стола. После слайсинга пользователь
-        // двигает уже готовый G-code, и смещение записывается при сохранении.
         s.modelCenterX = 110;
         s.modelCenterY = 110;
         s.nozzleDiameter = 0.4;
@@ -375,27 +535,12 @@ public class MainActivity extends Activity {
     }
 
     private String makeGcodeName() {
-        String name = getSelectedFileName();
+        String name = selectedModelName;
         if (name == null || name.trim().isEmpty()) return "model.gcode";
-        String lower = name.toLowerCase();
-        if (lower.endsWith(".stl")) name = name.substring(0, name.length() - 4);
+        String lower = name.toLowerCase(Locale.US);
+        if (lower.endsWith(".stl") || lower.endsWith(".3mf"))
+            name = name.substring(0, name.length() - 4);
         return name + ".gcode";
-    }
-
-    private String getSelectedFileName() {
-        if (selectedFile == null) return null;
-        Cursor cursor = null;
-        try {
-            cursor = getContentResolver().query(selectedFile, null, null, null, null);
-            if (cursor != null && cursor.moveToFirst()) {
-                int index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
-                if (index >= 0) return cursor.getString(index);
-            }
-        } catch (Exception ignored) {
-        } finally {
-            if (cursor != null) cursor.close();
-        }
-        return null;
     }
 
     private String getDisplayName(Uri uri) {
@@ -526,13 +671,9 @@ public class MainActivity extends Activity {
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
 
-        if (requestCode == REQ_OPEN_STL && resultCode == RESULT_OK && data != null) {
+        if (requestCode == REQ_OPEN_MODEL && resultCode == RESULT_OK && data != null) {
             Uri uri = data.getData();
             if (uri == null) return;
-
-            selectedFile = uri;
-            generatedGcode = null;
-            hideGcodePreview();
 
             try {
                 int flags = data.getFlags() &
@@ -540,20 +681,9 @@ public class MainActivity extends Activity {
                                 Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
                 getContentResolver().takePersistableUriPermission(
                         uri, flags & Intent.FLAG_GRANT_READ_URI_PERMISSION);
-            } catch (Exception ignored) {
-            }
+            } catch (Exception ignored) {}
 
-            String fileName = getSelectedFileName();
-            fileInfo.setText(fileName == null ? "STL выбран" : fileName);
-
-            try {
-                stlViewer.loadSTL(uri);
-                status.setText("3D-модель загружена. Задайте параметры печати и создайте G-code.");
-            } catch (Exception e) {
-                selectedFile = null;
-                fileInfo.setText("Ошибка открытия STL");
-                status.setText(safeMessage(e));
-            }
+            processModelUri(uri);
             return;
         }
 

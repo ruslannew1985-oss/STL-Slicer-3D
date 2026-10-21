@@ -1,23 +1,32 @@
-
 package com.stlslicer.app;
 
 import android.app.Activity;
 import android.os.Bundle;
 import android.content.Intent;
 import android.net.Uri;
-import android.view.View;
-import android.widget.*;
+import android.provider.OpenableColumns;
+import android.database.Cursor;
 import android.graphics.Color;
-import java.io.InputStream;
+import android.widget.*;
+
+import java.io.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class MainActivity extends Activity {
 
-    TextView fileInfo, status;
-    EditText nozzle, bed, layer, speed, infill;
-    Uri selectedFile;
-STLViewer stlViewer;
-LinearLayout rootLayout;
-    EditText addField(LinearLayout root, String label, String value) {
+    private static final int REQ_OPEN_STL = 10;
+    private static final int REQ_SAVE_GCODE = 11;
+
+    private TextView fileInfo, status;
+    private EditText nozzle, bed, layer, speed, infill;
+    private Button sliceButton;
+    private Uri selectedFile;
+    private STLViewer stlViewer;
+    private File generatedGcode;
+    private final ExecutorService worker = Executors.newSingleThreadExecutor();
+
+    private EditText addField(LinearLayout root, String label, String value) {
         TextView text = new TextView(this);
         text.setText(label);
         text.setTextSize(16);
@@ -48,7 +57,7 @@ LinearLayout rootLayout;
         root.addView(title);
 
         TextView printer = new TextView(this);
-        printer.setText("Creality Ender-3 V3 SE | PETG");
+        printer.setText("Creality Ender-3 V3 SE | PETG | офлайн");
         printer.setTextSize(17);
         root.addView(printer);
 
@@ -60,12 +69,13 @@ LinearLayout rootLayout;
         fileInfo.setText("Файл не выбран");
         fileInfo.setTextSize(16);
         root.addView(fileInfo);
-        stlViewer = new STLViewer(this);
 
-root.addView(stlViewer, new LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.MATCH_PARENT,
-        600
-));
+        stlViewer = new STLViewer(this);
+        root.addView(stlViewer, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                600
+        ));
+
         TextView settings = new TextView(this);
         settings.setText("Параметры печати PETG");
         settings.setTextSize(21);
@@ -78,72 +88,216 @@ root.addView(stlViewer, new LinearLayout.LayoutParams(
         speed = addField(root, "Скорость печати (мм/с)", "50");
         infill = addField(root, "Заполнение (%)", "20");
 
-        Button slice = new Button(this);
-        slice.setText("ПОДГОТОВИТЬ G-CODE");
-        root.addView(slice);
+        sliceButton = new Button(this);
+        sliceButton.setText("СОЗДАТЬ G-CODE");
+        root.addView(sliceButton);
 
         status = new TextView(this);
         status.setText("Ожидание STL-файла");
         status.setTextSize(16);
         root.addView(status);
 
-        open.setOnClickListener(v -> {
-            Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-            intent.addCategory(Intent.CATEGORY_OPENABLE);
-            intent.setType("*/*");
-            startActivityForResult(intent, 10);
-        });
+        open.setOnClickListener(v -> openStl());
+        sliceButton.setOnClickListener(v -> startSlicing());
+    }
 
-        slice.setOnClickListener(v -> {
-            if (selectedFile == null) {
-                status.setText("Сначала выберите STL-файл");
-            } else {
-                status.setText(
-                    "STL выбран. Параметры PETG заданы. " +
-                    "Для создания G-code необходимо подключить " +
-                    "движок слайсинга."
+    private void openStl() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("*/*");
+        startActivityForResult(intent, REQ_OPEN_STL);
+    }
+
+    private void startSlicing() {
+        if (selectedFile == null) {
+            status.setText("Сначала выберите STL-файл");
+            return;
+        }
+
+        final SlicerEngine.Settings settings;
+        try {
+            settings = readSettings();
+            settings.validate();
+        } catch (Exception e) {
+            status.setText("Ошибка параметров: " + safeMessage(e));
+            return;
+        }
+
+        sliceButton.setEnabled(false);
+        status.setText("Подготовка модели...");
+
+        worker.execute(() -> {
+            File temp = new File(getCacheDir(), "stl_slicer_output.gcode");
+            try (InputStream in = getContentResolver().openInputStream(selectedFile);
+                 OutputStream out = new BufferedOutputStream(new FileOutputStream(temp))) {
+
+                if (in == null) throw new IOException("Не удалось открыть STL");
+
+                SlicerEngine.slice(in, out, settings, (current, total) -> {
+                    if (current == 1 || current == total || current % Math.max(1, total / 20) == 0) {
+                        int percent = (int)Math.round(current * 100.0 / total);
+                        runOnUiThread(() ->
+                                status.setText("Слайсинг: " + percent + "% (" + current + "/" + total + " слоёв)")
+                        );
+                    }
+                });
+
+                generatedGcode = temp;
+                runOnUiThread(() -> {
+                    sliceButton.setEnabled(true);
+                    status.setText("G-code готов. Выберите, куда сохранить файл.");
+                    askWhereToSave();
+                });
+            } catch (Exception e) {
+                if (temp.exists()) temp.delete();
+                runOnUiThread(() -> {
+                    sliceButton.setEnabled(true);
+                    status.setText("Ошибка слайсинга: " + safeMessage(e));
+                });
+            }
+        });
+    }
+
+    private SlicerEngine.Settings readSettings() {
+        SlicerEngine.Settings s = new SlicerEngine.Settings();
+        s.nozzleTemperature = parseNumber(nozzle, "температура сопла");
+        s.bedTemperature = parseNumber(bed, "температура стола");
+        s.layerHeight = parseNumber(layer, "высота слоя");
+        s.printSpeed = parseNumber(speed, "скорость");
+        s.infillPercent = parseNumber(infill, "заполнение");
+
+        s.nozzleDiameter = 0.4;
+        s.filamentDiameter = 1.75;
+        s.perimeterCount = 2;
+        s.travelSpeed = 150;
+        s.extrusionMultiplier = 1.0;
+        s.bedSizeX = 220;
+        s.bedSizeY = 220;
+        return s;
+    }
+
+    private double parseNumber(EditText field, String name) {
+        String text = field.getText().toString().trim().replace(',', '.');
+        if (text.isEmpty()) throw new IllegalArgumentException("не заполнено поле: " + name);
+        try {
+            return Double.parseDouble(text);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("неверное число: " + name);
+        }
+    }
+
+    private void askWhereToSave() {
+        if (generatedGcode == null || !generatedGcode.exists()) {
+            status.setText("G-code не найден");
+            return;
+        }
+
+        Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("text/plain");
+        intent.putExtra(Intent.EXTRA_TITLE, makeGcodeName());
+        startActivityForResult(intent, REQ_SAVE_GCODE);
+    }
+
+    private String makeGcodeName() {
+        String name = getSelectedFileName();
+        if (name == null || name.trim().isEmpty()) return "model.gcode";
+        String lower = name.toLowerCase();
+        if (lower.endsWith(".stl")) name = name.substring(0, name.length() - 4);
+        return name + ".gcode";
+    }
+
+    private String getSelectedFileName() {
+        if (selectedFile == null) return null;
+        Cursor cursor = null;
+        try {
+            cursor = getContentResolver().query(selectedFile, null, null, null, null);
+            if (cursor != null && cursor.moveToFirst()) {
+                int index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                if (index >= 0) return cursor.getString(index);
+            }
+        } catch (Exception ignored) {
+        } finally {
+            if (cursor != null) cursor.close();
+        }
+        return null;
+    }
+
+    private void saveGeneratedGcode(Uri destination) {
+        if (generatedGcode == null || !generatedGcode.exists()) {
+            status.setText("Нет готового G-code");
+            return;
+        }
+
+        status.setText("Сохранение G-code...");
+        worker.execute(() -> {
+            try (InputStream in = new BufferedInputStream(new FileInputStream(generatedGcode));
+                 OutputStream out = getContentResolver().openOutputStream(destination, "w")) {
+
+                if (out == null) throw new IOException("Не удалось открыть место сохранения");
+
+                byte[] buffer = new byte[64 * 1024];
+                int n;
+                while ((n = in.read(buffer)) != -1) out.write(buffer, 0, n);
+                out.flush();
+
+                runOnUiThread(() ->
+                        status.setText("Готово: G-code сохранён в память телефона")
+                );
+            } catch (Exception e) {
+                runOnUiThread(() ->
+                        status.setText("Ошибка сохранения: " + safeMessage(e))
                 );
             }
         });
     }
 
+    private String safeMessage(Throwable e) {
+        String msg = e.getMessage();
+        return (msg == null || msg.trim().isEmpty()) ? e.getClass().getSimpleName() : msg;
+    }
+
     @Override
-    protected void onActivityResult(
-        int requestCode,
-        int resultCode,
-        Intent data
-    ) {
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
 
-        if (requestCode == 10 &&
-            resultCode == RESULT_OK &&
-            data != null) {
-
+        if (requestCode == REQ_OPEN_STL && resultCode == RESULT_OK && data != null) {
             Uri uri = data.getData();
+            if (uri == null) return;
 
-            if (uri != null) {
-                String path = uri.toString();
+            selectedFile = uri;
+            generatedGcode = null;
 
-                if (!path.toLowerCase().endsWith(".stl") &&
-                    !path.toLowerCase().contains(".stl")) {
-                    fileInfo.setText(
-                        "Выбран файл. Убедитесь, что это STL."
-                    );
-                } else {
-                    fileInfo.setText("STL выбран");
-                }
-
-                selectedFile = uri;
-                try {
-    stlViewer.loadSTL(uri);
-    fileInfo.setText("3D-модель загружена");
-    status.setText("Вращайте модель пальцем");
-} catch (Exception e) {
-    fileInfo.setText("Ошибка открытия STL");
-    status.setText(e.getMessage());
-                }
-                status.setText("Файл готов к обработке");
+            try {
+                int flags = data.getFlags() &
+                        (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                getContentResolver().takePersistableUriPermission(uri, flags & Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            } catch (Exception ignored) {
             }
+
+            String fileName = getSelectedFileName();
+            fileInfo.setText(fileName == null ? "STL выбран" : fileName);
+
+            try {
+                stlViewer.loadSTL(uri);
+                status.setText("3D-модель загружена. Вращайте пальцем или создайте G-code.");
+            } catch (Exception e) {
+                selectedFile = null;
+                fileInfo.setText("Ошибка открытия STL");
+                status.setText(safeMessage(e));
+            }
+            return;
         }
+
+        if (requestCode == REQ_SAVE_GCODE && resultCode == RESULT_OK && data != null) {
+            Uri uri = data.getData();
+            if (uri != null) saveGeneratedGcode(uri);
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        worker.shutdownNow();
     }
 }

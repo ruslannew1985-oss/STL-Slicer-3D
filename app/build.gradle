@@ -11,7 +11,7 @@ android {
     defaultConfig {
         applicationId 'com.stlslicer.app'
         minSdk 24
-        targetSdk 28
+        targetSdk 35
         versionCode 1000 + ciBuildNumber
         versionName "1.2.${ciBuildNumber}"
     }

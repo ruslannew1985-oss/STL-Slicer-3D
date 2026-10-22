@@ -9,7 +9,7 @@
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
 
         <activity
-            android:name="com.stlslicer.app.MainActivity"
+            android:name="com.stlslicer.app.PrintableMainActivity"
             android:exported="true"
             android:launchMode="singleTop">
 
@@ -18,7 +18,6 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
 
-            <!-- Open model files from Telegram, Downloads and file managers. -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
@@ -32,7 +31,6 @@
                 <data android:mimeType="application/octet-stream" />
             </intent-filter>
 
-            <!-- Some providers expose a generic MIME type but keep the extension in the URI. -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
@@ -44,7 +42,6 @@
                 <data android:scheme="file" android:mimeType="*/*" android:pathPattern=".*\.zip" />
             </intent-filter>
 
-            <!-- Also support Telegram/File-manager Share actions. -->
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
                 <category android:name="android.intent.category.DEFAULT" />

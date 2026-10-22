@@ -2,6 +2,8 @@ plugins {
     id 'com.android.application' version '8.7.3'
 }
 
+def ciBuildNumber = (System.getenv('GITHUB_RUN_NUMBER') ?: '1').toInteger()
+
 android {
     namespace 'com.stlslicer.app'
     compileSdk 35
@@ -10,8 +12,14 @@ android {
         applicationId 'com.stlslicer.app'
         minSdk 24
         targetSdk 28
-        versionCode 2
-        versionName '1.1'
+        versionCode 1000 + ciBuildNumber
+        versionName "1.2.${ciBuildNumber}"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
     }
 
     compileOptions {

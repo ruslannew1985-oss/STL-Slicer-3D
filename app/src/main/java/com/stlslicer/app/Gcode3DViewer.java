@@ -1,0 +1,615 @@
+package com.stlslicer.app;
+
+import android.content.Context;
+import android.opengl.GLSurfaceView;
+import android.opengl.GLU;
+import android.view.MotionEvent;
+
+import java.io.*;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.FloatBuffer;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+
+import javax.microedition.khronos.egl.EGLConfig;
+import javax.microedition.khronos.opengles.GL10;
+
+public class Gcode3DViewer extends GLSurfaceView {
+
+    public interface OnPlacementChangedListener {
+        void onPlacementChanged(float centerX, float centerY);
+    }
+
+    private final ToolpathRenderer renderer;
+    private float lastX, lastY;
+    private float pinchDistance = -1f;
+    private boolean placementMode = false;
+    private OnPlacementChangedListener placementListener;
+
+    public Gcode3DViewer(Context context) {
+        super(context);
+        setEGLContextClientVersion(1);
+        renderer = new ToolpathRenderer();
+        setRenderer(renderer);
+        setRenderMode(GLSurfaceView.RENDERMODE_WHEN_DIRTY);
+    }
+
+    public int loadGcode(File file) throws IOException {
+        List<float[]> layers = parseGcode(file);
+        if (layers.isEmpty()) {
+            throw new IOException("В G-code не найдено печатных траекторий");
+        }
+        renderer.setLayers(layers);
+        renderer.setLayer(layers.size() - 1);
+        placementMode = false;
+        requestRender();
+        notifyPlacement();
+        return layers.size();
+    }
+
+    public int getLayerCount() {
+        return renderer.getLayerCount();
+    }
+
+    public void setLayer(int layer) {
+        renderer.setLayer(layer);
+        requestRender();
+    }
+
+    public void resetView() {
+        renderer.resetView();
+        placementMode = false;
+        requestRender();
+    }
+
+    public void setPlacementMode(boolean enabled) {
+        placementMode = enabled;
+        if (enabled) renderer.topView();
+        else renderer.threeDView();
+        requestRender();
+    }
+
+    public boolean isPlacementMode() {
+        return placementMode;
+    }
+
+    public void centerOnBed() {
+        renderer.centerOnBed();
+        requestRender();
+        notifyPlacement();
+    }
+
+    public float getOffsetX() {
+        return renderer.getOffsetX();
+    }
+
+    public float getOffsetY() {
+        return renderer.getOffsetY();
+    }
+
+    public float getModelCenterX() {
+        return renderer.getPlacedCenterX();
+    }
+
+    public float getModelCenterY() {
+        return renderer.getPlacedCenterY();
+    }
+
+    public void setOnPlacementChangedListener(OnPlacementChangedListener listener) {
+        placementListener = listener;
+    }
+
+    private void notifyPlacement() {
+        if (placementListener != null) {
+            placementListener.onPlacementChanged(
+                    renderer.getPlacedCenterX(), renderer.getPlacedCenterY());
+        }
+    }
+
+    private List<float[]> parseGcode(File file) throws IOException {
+        List<List<Float>> rawLayers = new ArrayList<>();
+        int currentLayer = -1;
+
+        double x = 0, y = 0, z = 0, e = 0;
+        boolean absoluteXYZ = true;
+        boolean absoluteE = true;
+
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(
+                new FileInputStream(file), StandardCharsets.US_ASCII), 64 * 1024)) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                line = line.trim();
+
+                if (line.startsWith(";LAYER:")) {
+                    try {
+                        currentLayer = Integer.parseInt(line.substring(7).trim());
+                    } catch (Exception ignored) {
+                        currentLayer++;
+                    }
+                    while (rawLayers.size() <= currentLayer) {
+                        rawLayers.add(new ArrayList<>());
+                    }
+                    continue;
+                }
+
+                if (line.startsWith("G90")) {
+                    absoluteXYZ = true;
+                    continue;
+                }
+                if (line.startsWith("G91")) {
+                    absoluteXYZ = false;
+                    continue;
+                }
+                if (line.startsWith("M82")) {
+                    absoluteE = true;
+                    continue;
+                }
+                if (line.startsWith("M83")) {
+                    absoluteE = false;
+                    continue;
+                }
+                if (line.startsWith("G92")) {
+                    Double ne = valueOf(line, 'E');
+                    if (ne != null) e = ne;
+                    continue;
+                }
+
+                String command = firstWord(line).toUpperCase();
+                if (!(command.equals("G0") || command.equals("G00") ||
+                        command.equals("G1") || command.equals("G01"))) {
+                    continue;
+                }
+
+                Double vx = valueOf(line, 'X');
+                Double vy = valueOf(line, 'Y');
+                Double vz = valueOf(line, 'Z');
+                Double ve = valueOf(line, 'E');
+
+                double nx = vx == null ? x : (absoluteXYZ ? vx : x + vx);
+                double ny = vy == null ? y : (absoluteXYZ ? vy : y + vy);
+                double nz = vz == null ? z : (absoluteXYZ ? vz : z + vz);
+                double ne = ve == null ? e : (absoluteE ? ve : e + ve);
+
+                boolean extruding = ve != null && ne > e + 1e-7;
+                if (extruding && currentLayer >= 0 &&
+                        (Math.abs(nx - x) > 1e-7 || Math.abs(ny - y) > 1e-7)) {
+                    while (rawLayers.size() <= currentLayer) {
+                        rawLayers.add(new ArrayList<>());
+                    }
+                    List<Float> layer = rawLayers.get(currentLayer);
+                    add(layer, (float) x, (float) y, (float) z);
+                    add(layer, (float) nx, (float) ny, (float) nz);
+                }
+
+                x = nx;
+                y = ny;
+                z = nz;
+                e = ne;
+            }
+        }
+
+        List<float[]> layers = new ArrayList<>();
+        for (List<Float> src : rawLayers) {
+            float[] a = new float[src.size()];
+            for (int i = 0; i < a.length; i++) a[i] = src.get(i);
+            layers.add(a);
+        }
+        return layers;
+    }
+
+    private static String firstWord(String line) {
+        String t = line.trim();
+        int space = t.indexOf(' ');
+        int tab = t.indexOf('\t');
+        int end;
+        if (space < 0) end = tab;
+        else if (tab < 0) end = space;
+        else end = Math.min(space, tab);
+        return end < 0 ? t : t.substring(0, end);
+    }
+
+    private static void add(List<Float> list, float x, float y, float z) {
+        list.add(x);
+        list.add(y);
+        list.add(z);
+    }
+
+    private static Double valueOf(String line, char key) {
+        int comment = line.indexOf(';');
+        if (comment >= 0) line = line.substring(0, comment);
+
+        for (int i = 0; i < line.length(); i++) {
+            if (Character.toUpperCase(line.charAt(i)) == key) {
+                int j = i + 1;
+                while (j < line.length() && Character.isWhitespace(line.charAt(j))) j++;
+                int k = j;
+                while (k < line.length()) {
+                    char c = line.charAt(k);
+                    if ((c >= '0' && c <= '9') || c == '-' || c == '+' ||
+                            c == '.' || c == 'e' || c == 'E') {
+                        k++;
+                    } else {
+                        break;
+                    }
+                }
+                if (k > j) {
+                    try {
+                        return Double.parseDouble(line.substring(j, k));
+                    } catch (Exception ignored) {
+                        return null;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    private void lockParentScroll(boolean lock) {
+        if (getParent() != null) {
+            getParent().requestDisallowInterceptTouchEvent(lock);
+        }
+    }
+
+    @Override
+    public boolean onTouchEvent(MotionEvent event) {
+        int action = event.getActionMasked();
+
+        if (action == MotionEvent.ACTION_DOWN ||
+                action == MotionEvent.ACTION_POINTER_DOWN ||
+                action == MotionEvent.ACTION_MOVE) {
+            lockParentScroll(true);
+        }
+
+        if (action == MotionEvent.ACTION_UP ||
+                action == MotionEvent.ACTION_CANCEL) {
+            lockParentScroll(false);
+        }
+
+        if (event.getPointerCount() >= 2) {
+            float dx = event.getX(0) - event.getX(1);
+            float dy = event.getY(0) - event.getY(1);
+            float d = (float) Math.hypot(dx, dy);
+
+            if (action == MotionEvent.ACTION_MOVE && pinchDistance > 0) {
+                renderer.zoom(d / pinchDistance);
+                requestRender();
+            }
+            pinchDistance = d;
+            return true;
+        }
+
+        pinchDistance = -1f;
+
+        if (action == MotionEvent.ACTION_DOWN) {
+            lastX = event.getX();
+            lastY = event.getY();
+            return true;
+        }
+
+        if (action == MotionEvent.ACTION_MOVE) {
+            float dx = event.getX() - lastX;
+            float dy = event.getY() - lastY;
+
+            if (placementMode) {
+                renderer.moveOnBed(dx, dy, getWidth(), getHeight());
+                notifyPlacement();
+            } else {
+                renderer.rotate(dx, dy);
+            }
+
+            lastX = event.getX();
+            lastY = event.getY();
+            requestRender();
+        }
+
+        return true;
+    }
+
+    private static class ToolpathRenderer implements Renderer {
+        private static final float BED_X = 220f;
+        private static final float BED_Y = 220f;
+
+        private List<float[]> layers = new ArrayList<>();
+        private int selectedLayer = 0;
+
+        private FloatBuffer lowerBuffer;
+        private FloatBuffer currentBuffer;
+        private FloatBuffer bedBuffer;
+
+        private int lowerVertices = 0;
+        private int currentVertices = 0;
+        private int bedVertices = 0;
+
+        private float minX, minY, minZ, maxX, maxY, maxZ;
+        private float originalCenterX = 110f;
+        private float originalCenterY = 110f;
+        private float offsetX = 0f;
+        private float offsetY = 0f;
+        private float worldCenterZ = 0f;
+        private float worldScale = 1f;
+
+        private float rotX = 58f;
+        private float rotY = -38f;
+        private float zoom = 1f;
+
+        ToolpathRenderer() {
+            buildBed();
+        }
+
+        synchronized int getLayerCount() {
+            return layers.size();
+        }
+
+        synchronized float getOffsetX() {
+            return offsetX;
+        }
+
+        synchronized float getOffsetY() {
+            return offsetY;
+        }
+
+        synchronized float getPlacedCenterX() {
+            return originalCenterX + offsetX;
+        }
+
+        synchronized float getPlacedCenterY() {
+            return originalCenterY + offsetY;
+        }
+
+        synchronized void resetView() {
+            rotX = 58f;
+            rotY = -38f;
+            zoom = 1f;
+        }
+
+        synchronized void threeDView() {
+            rotX = 58f;
+            rotY = -38f;
+            zoom = 1f;
+        }
+
+        synchronized void topView() {
+            rotX = 0f;
+            rotY = 0f;
+            zoom = 1f;
+        }
+
+        synchronized void rotate(float dx, float dy) {
+            rotY += dx * 0.65f;
+            rotX += dy * 0.65f;
+            rotX = Math.max(-180f, Math.min(180f, rotX));
+        }
+
+        synchronized void zoom(float ratio) {
+            if (ratio > 0.1f && ratio < 10f) {
+                zoom = Math.max(0.35f, Math.min(6f, zoom * ratio));
+            }
+        }
+
+        synchronized void centerOnBed() {
+            offsetX = 110f - originalCenterX;
+            offsetY = 110f - originalCenterY;
+            clampOffset();
+        }
+
+        synchronized void moveOnBed(float pixelDx, float pixelDy,
+                                    int width, int height) {
+            if (width <= 0 || height <= 0) return;
+
+            float visibleMm = 255f / Math.max(0.35f, zoom);
+            float mmPerPixel = visibleMm / Math.max(1f, Math.min(width, height));
+
+            offsetX += pixelDx * mmPerPixel;
+            offsetY -= pixelDy * mmPerPixel;
+            clampOffset();
+        }
+
+        private void clampOffset() {
+            if (!Float.isFinite(minX) || !Float.isFinite(maxX)) return;
+
+            float minOffX = -minX;
+            float maxOffX = BED_X - maxX;
+            float minOffY = -minY;
+            float maxOffY = BED_Y - maxY;
+
+            if (minOffX <= maxOffX) {
+                offsetX = Math.max(minOffX, Math.min(maxOffX, offsetX));
+            }
+            if (minOffY <= maxOffY) {
+                offsetY = Math.max(minOffY, Math.min(maxOffY, offsetY));
+            }
+        }
+
+        synchronized void setLayers(List<float[]> newLayers) {
+            layers = newLayers;
+            selectedLayer = Math.max(0, layers.size() - 1);
+            offsetX = 0f;
+            offsetY = 0f;
+            computeBounds();
+            rebuildBuffers();
+        }
+
+        synchronized void setLayer(int layer) {
+            if (layers.isEmpty()) return;
+            selectedLayer = Math.max(0, Math.min(layers.size() - 1, layer));
+            rebuildBuffers();
+        }
+
+        private void computeBounds() {
+            minX = Float.POSITIVE_INFINITY;
+            minY = Float.POSITIVE_INFINITY;
+            minZ = Float.POSITIVE_INFINITY;
+            maxX = Float.NEGATIVE_INFINITY;
+            maxY = Float.NEGATIVE_INFINITY;
+            maxZ = Float.NEGATIVE_INFINITY;
+
+            for (float[] layer : layers) {
+                for (int i = 0; i + 2 < layer.length; i += 3) {
+                    minX = Math.min(minX, layer[i]);
+                    maxX = Math.max(maxX, layer[i]);
+                    minY = Math.min(minY, layer[i + 1]);
+                    maxY = Math.max(maxY, layer[i + 1]);
+                    minZ = Math.min(minZ, layer[i + 2]);
+                    maxZ = Math.max(maxZ, layer[i + 2]);
+                }
+            }
+
+            if (!Float.isFinite(minX)) {
+                minX = minY = minZ = 0f;
+                maxX = maxY = maxZ = 1f;
+            }
+
+            originalCenterX = (minX + maxX) * 0.5f;
+            originalCenterY = (minY + maxY) * 0.5f;
+            worldCenterZ = Math.max(0f, maxZ * 0.5f);
+
+            float worldSize = Math.max(240f,
+                    Math.max(BED_X, Math.max(BED_Y, maxZ + 20f)));
+            worldScale = 1.75f / worldSize;
+            clampOffset();
+        }
+
+        private void buildBed() {
+            List<Float> v = new ArrayList<>();
+
+            addLine(v, 0, 0, 0, BED_X, 0, 0);
+            addLine(v, BED_X, 0, 0, BED_X, BED_Y, 0);
+            addLine(v, BED_X, BED_Y, 0, 0, BED_Y, 0);
+            addLine(v, 0, BED_Y, 0, 0, 0, 0);
+
+            for (float p = 20f; p < BED_X; p += 20f) {
+                addLine(v, p, 0, 0, p, BED_Y, 0);
+            }
+            for (float p = 20f; p < BED_Y; p += 20f) {
+                addLine(v, 0, p, 0, BED_X, p, 0);
+            }
+
+            addLine(v, 110, 0, 0.02f, 110, BED_Y, 0.02f);
+            addLine(v, 0, 110, 0.02f, BED_X, 110, 0.02f);
+
+            float[] data = new float[v.size()];
+            for (int i = 0; i < data.length; i++) data[i] = v.get(i);
+
+            bedBuffer = toBuffer(data);
+            bedVertices = data.length / 3;
+        }
+
+        private static void addLine(List<Float> v,
+                                    float x1, float y1, float z1,
+                                    float x2, float y2, float z2) {
+            v.add(x1);
+            v.add(y1);
+            v.add(z1);
+            v.add(x2);
+            v.add(y2);
+            v.add(z2);
+        }
+
+        private void rebuildBuffers() {
+            int lowerFloats = 0;
+            for (int i = 0; i < selectedLayer; i++) {
+                lowerFloats += layers.get(i).length;
+            }
+
+            float[] lower = new float[lowerFloats];
+            int pos = 0;
+            for (int i = 0; i < selectedLayer; i++) {
+                float[] src = layers.get(i);
+                System.arraycopy(src, 0, lower, pos, src.length);
+                pos += src.length;
+            }
+
+            float[] current = layers.isEmpty()
+                    ? new float[0]
+                    : layers.get(selectedLayer);
+
+            lowerBuffer = toBuffer(lower);
+            currentBuffer = toBuffer(current);
+            lowerVertices = lower.length / 3;
+            currentVertices = current.length / 3;
+        }
+
+        private FloatBuffer toBuffer(float[] data) {
+            ByteBuffer bb = ByteBuffer.allocateDirect(Math.max(1, data.length) * 4)
+                    .order(ByteOrder.nativeOrder());
+            FloatBuffer fb = bb.asFloatBuffer();
+            if (data.length > 0) fb.put(data);
+            fb.position(0);
+            return fb;
+        }
+
+        @Override
+        public void onSurfaceCreated(GL10 gl, EGLConfig config) {
+            gl.glClearColor(0.07f, 0.08f, 0.11f, 1f);
+            gl.glEnable(GL10.GL_DEPTH_TEST);
+            gl.glEnable(GL10.GL_BLEND);
+            gl.glBlendFunc(GL10.GL_SRC_ALPHA, GL10.GL_ONE_MINUS_SRC_ALPHA);
+            gl.glDisable(GL10.GL_LIGHTING);
+            gl.glDisable(GL10.GL_CULL_FACE);
+        }
+
+        @Override
+        public void onSurfaceChanged(GL10 gl, int w, int h) {
+            gl.glViewport(0, 0, w, h);
+            gl.glMatrixMode(GL10.GL_PROJECTION);
+            gl.glLoadIdentity();
+            GLU.gluPerspective(gl, 45f,
+                    (float) w / Math.max(1, h),
+                    0.1f, 100f);
+            gl.glMatrixMode(GL10.GL_MODELVIEW);
+        }
+
+        @Override
+        public synchronized void onDrawFrame(GL10 gl) {
+            gl.glClear(GL10.GL_COLOR_BUFFER_BIT | GL10.GL_DEPTH_BUFFER_BIT);
+            gl.glLoadIdentity();
+            gl.glTranslatef(0f, 0f, -4f);
+            gl.glScalef(zoom, zoom, zoom);
+            gl.glRotatef(rotX, 1, 0, 0);
+            gl.glRotatef(rotY, 0, 1, 0);
+            gl.glScalef(worldScale, worldScale, worldScale);
+            gl.glTranslatef(-110f, -110f, -worldCenterZ);
+
+            gl.glEnableClientState(GL10.GL_VERTEX_ARRAY);
+
+            // Bed stays solid so orientation remains easy to understand.
+            gl.glEnable(GL10.GL_DEPTH_TEST);
+            if (bedVertices > 0) {
+                bedBuffer.position(0);
+                gl.glVertexPointer(3, GL10.GL_FLOAT, 0, bedBuffer);
+                gl.glColor4f(0.42f, 0.45f, 0.50f, 1f);
+                gl.glLineWidth(1.2f);
+                gl.glDrawArrays(GL10.GL_LINES, 0, bedVertices);
+            }
+
+            gl.glPushMatrix();
+            gl.glTranslatef(offsetX, offsetY, 0f);
+
+            // X-ray toolpath rendering: depth test is disabled only for the part.
+            // This makes internal walls and infill visible through the outside shell.
+            gl.glDisable(GL10.GL_DEPTH_TEST);
+
+            if (lowerVertices > 0) {
+                lowerBuffer.position(0);
+                gl.glVertexPointer(3, GL10.GL_FLOAT, 0, lowerBuffer);
+                gl.glColor4f(0.10f, 0.55f, 0.95f, 0.24f);
+                gl.glLineWidth(1.15f);
+                gl.glDrawArrays(GL10.GL_LINES, 0, lowerVertices);
+            }
+
+            if (currentVertices > 0) {
+                currentBuffer.position(0);
+                gl.glVertexPointer(3, GL10.GL_FLOAT, 0, currentBuffer);
+                gl.glColor4f(0.10f, 0.95f, 0.78f, 0.95f);
+                gl.glLineWidth(2.5f);
+                gl.glDrawArrays(GL10.GL_LINES, 0, currentVertices);
+            }
+
+            gl.glEnable(GL10.GL_DEPTH_TEST);
+            gl.glPopMatrix();
+            gl.glDisableClientState(GL10.GL_VERTEX_ARRAY);
+        }
+    }
+}

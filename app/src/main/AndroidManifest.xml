@@ -10,7 +10,7 @@
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
 
         <activity
-            android:name="com.stlslicer.app.MainActivity"
+            android:name="com.stlslicer.app.MainActivityV13"
             android:screenOrientation="portrait"
             android:exported="true">
 
